@@ -9,5 +9,5 @@ description = "JNI bridge: Kotlin <-> mush-core (Mush A' Android)"
 crate-type = ["cdylib"]
 
 [dependencies]
-mush-core = { path = "../../mush-core" }
+mush-core = { path = "../mush-core" }
 jni = "0.21"
