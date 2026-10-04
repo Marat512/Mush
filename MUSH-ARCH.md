@@ -1,88 +1,91 @@
-# MUSH Architecture — маппинг на Mycerus
+# MUSH-ARCH — техническая архитектура
 
-**Версия:** 0.2.0
-**Дата:** 2026-09-28
-**Статус:** Архитектурное предложение (не нормативно)
-**Гейт:** работы по MUSH не начинаются без явного двухкратного подтверждения владельца (см. MUSH-CONCEPT, шапка)
-**База:** Mycerus MVP (этапы 1–19A) + ATTACK-MODEL v0.5.0 (MEB-SPEC v0.1.2, MGR-API-SPEC v0.2, GENOME-SPEC v0.1)
+**Версия:** 0.2.1  
+**Дата:** 2026-09-29  
+**Статус:** Техническая спецификация — компоненты, протоколы, роадмап  
+**База:** MUSH.md (манифест) + ATTACK-MODEL v0.3.0 + Mycerus MVP (этапы 1–16)  
+**Связанные документы:**
+- MUSH.md — манифест и пользовательское руководство
+- MUSH-PROTOCOL.md — формальные спецификации протоколов
+- MUSH-A'-SPEC.md — спецификация первого прототипа
+- MUSH-A'-CLI-SPEC.md — Rust CLI прототип (промежуточный шаг)
+- MUSH-BRIDGE-ARCH.md — справочник по адаптерам сторонних сетей (B-статус)
 
 ---
 
 ## 1. Принцип: пользователь видит ягоду, под землёй — грибница
 
-| Человек видит | Под капотом (Mycerus) | Компонент MUSH |
+| Человек видит | Под капотом (Mycerus) | Компонент Mush |
 |---------------|----------------------|---------------------|
-| Контакты | SBP-handshake (люди) + QR/NFC | `MUSH Contacts` |
-| Чаты | CRDT-история + bundle | `MUSH Chats` |
-| Отправить сообщение | MEB + POT + store-carry-forward | `MUSH Core` |
-| Доставлено | SRE receipt + подписанный ReportE2EDelivery (MGR-API-SPEC §4.12) | `MUSH Core` |
-| Настройки приватности | Genome constraints | `MUSH Vault` |
-| Резервная копия | SBP + споры | `MUSH Spores` |
-| Сеть рядом | POT + CLA + MGR gradient | `MUSH Transport` |
-| Групповой чат | Сервер-грибница (выделенный узел/узлы группы) | `MUSH Groups` |
-| Мульти-устройство | Sync через споры (encrypted snapshot) | `MUSH Spores` |
+| Контакты | SNS + QR-handshake | `Mush Contacts` |
+| Чаты | CRDT-история + bundle | `Mush Chats` |
+| Отправить сообщение | MEB + POT + store-carry-forward | `Mush Core` |
+| Доставлено | SRE receipt + ReportE2EDelivery | `Mush Core` |
+| Настройки приватности | Genome constraints | `Mush Vault` |
+| Резервная копия | SBP + споры | `Mush Spores` |
+| Сеть рядом | POT + CLA + MGR gradient | `Mush Transport` |
+| Групповой чат | Сервер-грибница (выделенный узел/узлы группы) | `Mush Groups` |
+| Мульти-устройство | Sync через споры (encrypted snapshot) | `Mush Spores` |
 
 **Пользователь никогда не видит:** BPv7, MEB, MGR, градиенты, Immune Block, Vironet. Он видит чаты, которые всегда работают.
 
-**Терминология:** SNS-handshake — аутентификация **узлов** (challenge-response, ТЗ §9). SBP-handshake — handshake **людей** (добавление контакта, §2.2). Это разные уровни; не смешивать.
-
 ---
 
-## 2. Компоненты MUSH
+## 2. Компоненты Mush
 
-### 2.1. MUSH Core
+### 2.1. Mush Core
 
-**Задача:** Интерфейс между MUSH и Mycerus DTN. Формирует bundle'ы, получает их из сети, управляет lifecycle сообщения.
+**Задача:** Интерфейс между Mush и Mycerus DTN. Формирует bundle'ы, получает их из сети, управляет lifecycle сообщения.
 
-**Ложится на:** BPv7 Bundle Protocol + MEB (тип 200, MEB-SPEC v0.1.2) + Immune Block (тип 202, ATTACK-MODEL §6).
+**Ложится на:** BPv7 Bundle Protocol + MEB (тип 200) + Immune Block (тип 202).
 
 ```rust
-pub struct MUSHCore {
+pub struct MuShCore {
     mycerus: MycerusNode,           // BPv7 + MGR + SNS + POT
-    meb_adapter: MEBAdapter,         // формирование MEB (MEB-SPEC v0.1.2 §4)
+    meb_adapter: MEBAdapter,         // формирование MEB с privacy-aware hints
     message_queue: MessageQueue,     // исходящие, ожидающие контакта
     delivery_tracker: DeliveryTracker, // отслеживание ✓ / ✓✓ / ⏳
 }
 
-impl MUSHCore {
+impl MuShCore {
     /// Отправляет сообщение в сеть
-    pub fn send(&mut self, msg: MUSHMessage, dst: PubKey) -> MessageID {
-        let id = msg.id.clone();
-        // 1. Шифруем payload (E2E, см. §3)
-        let encrypted = self.onion.wrap(&msg, dst);
-        // 2. Формируем BPv7 bundle с MEB (MEB-SPEC v0.1.2 §4)
+    pub fn send(&mut self, msg: MuShMessage, dst: PubKey) -> MessageID {
+        // 1. Шифруем payload через Mush Onion
+        let encrypted = self.onion.wrap(msg, dst);
+        // 2. Формируем BPv7 bundle с MEB
         let bundle = self.build_bundle(encrypted, dst);
         // 3. Передаём в Mycerus для маршрутизации
         self.mycerus.submit(bundle);
         // 4. Возвращаем ID для отслеживания статуса
-        id
+        msg.id
     }
-
+    
     /// Вызывается при получении bundle из сети
     pub fn on_bundle_received(&mut self, bundle: Bundle) {
         // 1. Проверяем destination — нам ли?
         if !bundle.is_for_me(self.my_key) { return; }
-        // 2. Расшифровываем (E2E, см. §3)
+        // 2. Расшифровываем через Onion
         let msg = self.onion.unwrap(bundle.payload);
         // 3. Передаём в Chat Store
         self.chat_store.insert(msg);
-        // 4. Отправляем SRE-receipt / ReportE2EDelivery (если запрошено)
+        // 4. Отправляем SRE-receipt (если запрошено)
         self.send_receipt(bundle.source, bundle.id);
     }
 }
 ```
 
-**Privacy-aware MEB hints — ОТКРЫТЫЙ ВОПРОС (не реализуемо в текущем контракте).**
+**Privacy-aware MEB hints:** MEB обычно несёт `destination_affinity`, `visited`, `path_cost`. Для Mush эти поля — утечка метаданных. Поэтому:
+- `destination_affinity` заменяется на `privacy_zone` (грубая категория: local / regional / global), не конкретный destination.
+- `visited` хранится внутри Onion-обёртки, не в MEB.
+- `path_cost` вычисляется динамически по gradient, но не публикуется в bundle.
 
-MEB несёт `mgr_hint.destination_affinity`, `mgr_hint.path_cost`, `mgr_hint.visited` (MEB-SPEC v0.1.2 §4.2), а MGR/gradient routing требует их видимости для выбора next hop (MGR-API-SPEC v0.2). Идеи вроде замены `destination_affinity` на `privacy_zone` (грубая категория local/regional/global), сокрытия `visited` внутри onion-обёртки или непубликации `path_cost` **несовместимы с gradient routing**: маршрутизация с полностью скрытым destination в текущем протоколе невозможна. Это требует MEB-SPEC v0.2 + отдельного решения маршрутизации без видимого destination. До принятия такого решения MUSH использует MEB как есть (с видимыми mgr_hint) — см. честные ограничения §8.
-
-### 2.2. MUSH Contacts — двухфазный SBP
+### 2.2. Mush Contacts — двухфазный SBP
 
 **Задача:** Управление контактами с гарантией осознанного согласия.
 
-**Ложится на:** SNS/SRE (узловой уровень) + QR/NFC handshake (прикладной уровень).
+**Ложится на:** SNS/SRE + QR/NFC handshake.
 
-**Ключевой принцип:** В MUSH «знать адрес» и «иметь право отправить» — это одно и то же. Нельзя узнать адрес случайно, нельзя угадать, нельзя получить из базы. Только через физический обмен (QR, BLE-handshake, встреча). Это как обмен ключами — не действие, а согласие.
+**Ключевой принцип:** В MyceRus «знать адрес» и «иметь право отправить» — это одно и то же. Нельзя узнать адрес случайно, нельзя угадать, нельзя получить из базы. Только через физический обмен (QR, BLE-handshake, встреча). Это как обмен ключами — не действие, а согласие.
 
 ```rust
 pub struct Contact {
@@ -97,7 +100,7 @@ pub struct Contact {
 
 pub enum TrustLevel {
     Unknown,      // фаза 1: pubkey получен (QR/NFC), но handshake не завершён
-    Known,        // фаза 2: SBP-handshake успешен, запись в адресный список
+    Known,        // фаза 2: SNS-handshake успешен, запись в адресный список
     Verified,     // fingerprint сравнен лично (Safety Number)
 }
 ```
@@ -112,29 +115,27 @@ pub enum TrustLevel {
 - Боб знает pubkey Алисы, но **не может отправить сообщение**.
 - Pubkey не глобально маршрутизируем — MGR не знает, где искать Алису без beacon.
 
-**Фаза 2 — Подтверждение контакта (SBP-handshake):**
+**Фаза 2 — Подтверждение контакта (SNS-handshake):**
 ```
-Боб инициирует SBP-handshake с Алисой (challenge-response по Ed25519)
+Боб инициирует SNS-handshake с Алисой (challenge-response по Ed25519)
 Алиса подтверждает → оба записывают друг друга в локальный адресный список
 TrustLevel переходит в Known
 ```
 - Без фазы 2 фаза 1 бесполезна — знание pubkey ≠ право отправки.
-- SBP-handshake = взаимное согласие. Это защищает от «случайного» попадания в список.
-
-**Gate на отправку (связь с §3 и §5.6):** `init_session` и отправка сообщений возможны **только для контактов в статусе Known** (фаза 2 пройдена). Публичный pre-key (§3) даёт возможность установить E2E-сессию, но **не право доставки**: первый bundle от контакта в статусе Unknown принимается в **silent inbox** (см. §5.6), не в основной чат.
+- SNS-handshake = взаимное согласие. Это защищает от «случайного» попадания в список.
 
 **Приглашение через посредника:**
 - Алиса хочет познакомить Боба с Верой.
 - Алиса отправляет Бобу pubkey Веры (encrypted на pubkey Боба).
 - Боб получает pubkey, но Contact = Unknown.
-- Боб **должен сам инициировать SBP-handshake** с Верой.
+- Боб **должен сам инициировать SNS-handshake** с Верой.
 - Вера **должна сама подтвердить** — никто не может добавить Веру без её согласия.
 
-### 2.3. MUSH Chats
+### 2.3. Mush Chats
 
 **Задача:** Хранение истории, отображение, CRDT-синхронизация.
 
-**Ложится на:** Bundle Payload Block (тип 203 — зарезервирован, требует отдельной спецификации) + локальный Chat Store.
+**Ложится на:** Bundle Payload Block (тип 203) + локальный Chat Store.
 
 **Почему CRDT:**
 - В DTN порядок доставки не гарантирован. Сообщение 2 может прийти раньше сообщения 1.
@@ -143,7 +144,7 @@ TrustLevel переходит в Known
 
 ```rust
 pub struct ChatMessage {
-    id: MessageID,                   // ULID (содержит wall-clock; в проде — см. §2.6)
+    id: MessageID,                   // ULID (временная сортировка + уникальность)
     sender: PubKey,
     chat_id: ChatID,                 // hash(participant_pubkeys) для 1-to-1
     content: EncryptedContent,
@@ -167,11 +168,11 @@ impl ChatStore {
 
 **CRDT-тип:** OR-Map (Observed-Removed Map) с LWW (Last-Write-Wins) для содержимого. Удаление сообщения = tombstone (не физическое удаление, а метка для скрытия).
 
-### 2.4. MUSH Transport
+### 2.4. Mush Transport
 
 **Задача:** Управление CLA (Channel Layer Adapters), абстракция над радио.
 
-**Ложится на:** POT + CLA (WiFi-Direct / BLE / LAN / LoRa). Мобильные радиотранспорты — вне скоупа MVP Mycerus (ТЗ §3.2).
+**Ложится на:** POT + CLA (WiFi-Direct / BLE / LAN / LoRa).
 
 ```rust
 pub struct TransportManager {
@@ -207,7 +208,7 @@ pub struct MacRotationPolicy {
 
 **Trade-off:** ротация ломает BLE pairing (Android/iOS кэшируют MAC-LTK связь). Решение: identity поднимается на уровень выше — Noise-handshake по pubkey, не по MAC.
 
-### 2.5. MUSH Vault
+### 2.5. Mush Vault
 
 **Задача:** Encrypted local storage для сообщений, ключей, контактов.
 
@@ -235,7 +236,7 @@ impl Vault {
 
 **Plausible deniability:** опциональный hidden volume (как VeraCrypt). Пользователь может открыть Vault с "декоративным" паролем — покажется пустой чат. Реальные чаты — под другим паролем.
 
-### 2.6. MUSH Spores
+### 2.6. Mush Spores
 
 **Задача:** Backup, multi-device sync, эвакуация состояния.
 
@@ -263,7 +264,7 @@ impl SporeManager {
         self.mycerus.submit_high_reliability(spore.to_bundle());
         spore.id
     }
-
+    
     /// Подобрать spore из сети (на новом устройстве)
     pub fn germinate(&mut self, spore: &Spore) -> Vault {
         Vault::import_encrypted(&spore.encrypted_snapshot, &self.recovery_key)
@@ -276,9 +277,9 @@ impl SporeManager {
 - Устройство B при подключении к сети ищет spore'ы со своим pubkey → подбирает → germinate.
 - После germination оба устройства синхронизируются через CRDT-merge чатов.
 
-### 2.7. MUSH Onion
+### 2.7. Mush Onion
 
-**Задача:** Защита метаданных (дорожная карта — после этапа 22 + MEB v2, см. §9). Relay-узлы не должны знать, кто отправитель и получатель, и не должны отличать настоящий трафик от фона. **В текущей сети onion не работает** — MGR требует видимого destination (§2.1).
+**Задача:** Защита метаданных. Relay-узлы не должны знать, кто отправитель и получатель, и не должны отличать настоящий трафик от фона.
 
 **Ложится на:** Layered encryption поверх BPv7 bundle.
 
@@ -294,23 +295,22 @@ pub struct OnionLayer {
 
 impl OnionWrapper {
     /// Упаковка сообщения в onion
-    pub fn wrap(&self, msg: &MUSHMessage, path: &[PubKey]) -> Result<Bytes, OnionError> {
-        // 1. Шифруем сообщение для получателя (внутренний слой).
-        //    Пустой путь — ошибка: без получателя нечего упаковывать.
-        let recipient = path.last().ok_or(OnionError::EmptyPath)?;
-        let mut current = Noise::encrypt(msg, recipient)?;
+    pub fn wrap(&self, msg: &MuShMessage, path: &[PubKey]) -> Bytes {
+        // 1. Шифруем сообщение для получателя (внутренний слой)
+        let inner = Noise::encrypt(msg, &path.last().unwrap());
         // 2. Для каждого intermediate hop: оборачиваем в слой
+        let mut current = inner;
         for hop in path.iter().rev().skip(1) {
-            current = self.wrap_layer(current, hop)?;
+            current = self.wrap_layer(current, hop);
         }
-        Ok(current)
+        current
     }
 }
 ```
 
 **Паддинг:** все bundle'ы padding'ятся до ближайшего фиксированного размера (1 KB, 4 KB, 16 KB). Relay-узел не может определить, текст это или видео, по размеру.
 
-**Cover traffic:** фоновая генерация dummy bundle'ов с тем же размером и структурой, что и реальные. Dummy'ы расходуются как обычные bundle'ы, но destination = случайный ключ (dead drop). Relay-узлы не отличают dummy от real. Только при питании/зарядке (см. §8).
+**Cover traffic:** фоновая генерация dummy bundle'ов с тем же размером и структурой, что и реальные. Dummy'ы расходуются как обычные bundle'ы, но destination = случайный ключ (dead drop). Relay-узлы не отличают dummy от real.
 
 ```rust
 pub struct CoverTraffic {
@@ -319,9 +319,9 @@ pub struct CoverTraffic {
 }
 ```
 
-### 2.8. MUSH Groups — три режима группового чата
+### 2.8. Mush Groups — три режима группового чата
 
-MUSH поддерживает три режима группового общения:
+MyceRus поддерживает три режима группового общения:
 
 | Режим | Хост | История | Relay | Когда использовать |
 |-------|------|---------|-------|-------------------|
@@ -368,17 +368,16 @@ pub struct AdHocGroup {
 
 ---
 
-### 2.8.2. Fruiting Gateway — сервер-грибница (состояние канала)
+### 2.8.2. Fruiting Gateway — сервер-грибница
 
 **Задача:** Групповые чаты через выделенную грибницу-хост.
 
-**Ложится на:** CRDT-состояние + выделенный узел-грибница (§2.9).
+**Ложится на:** CRDT-состояние + выделенный узел-грибница.
 
-**Ключевой принцип:** В MUSH нет "общего чата в воздухе". Хочешь канал — поднимай свою грибницу. Это Discord-модель, но с честной экономикой: не "сервер компании", а твоя грибница.
+**Ключевой принцип:** В MyceRus нет "общего чата в воздухе". Хочешь канал — поднимай свою грибницу. Это Discord-модель, но с честной экономикой: не "сервер компании", а твоя грибница.
 
 ```rust
-/// Состояние одного хостимого канала (хранится внутри FruitingGateway, §2.9)
-pub struct ChannelState {
+pub struct FruitingGateway {
     owner: PubKey,                   // кто поднял грибницу
     channel_id: ChannelID,           // hash(owner_pubkey || creation_timestamp)
     members: CRDTSet<PubKey>,        // участники (OR-Set)
@@ -443,7 +442,7 @@ pub enum ModerationPolicy {
 
 ---
 
-### 2.9. Fruiting Gateway — роль сервера-грибницы (узел)
+### 2.9. Fruiting Gateway — роль сервера-грибницы
 
 **Fruiting Gateway** — это выделенный узел Mycerus, который:
 - Хостит канал/группу (хранит CRDT-состояние, relay'ит сообщения).
@@ -455,13 +454,13 @@ pub enum ModerationPolicy {
 pub struct FruitingGateway {
     // Mycerus node
     mycerus: MycerusNode,
-
-    // Hosted channels (состояние каналов — §2.8.2, ChannelState)
+    
+    // Hosted channels
     channels: HashMap<ChannelID, ChannelState>,
-
+    
     // Client connections (mobile nodes)
     clients: HashMap<PubKey, ClientSession>,
-
+    
     // Resource limits
     max_channels: usize,             // из конфига
     max_storage_per_channel: usize,  // в байтах
@@ -476,7 +475,7 @@ impl FruitingGateway {
         // 3. Создать ClientSession
         // 4. Начать синхронизацию (Merkle root → deltas)
     }
-
+    
     /// Получение сообщения от участника
     pub fn on_message(&mut self, msg: GroupMessage, channel_id: ChannelID) {
         // 1. Проверить подпись отправителя
@@ -504,7 +503,7 @@ impl FruitingGateway {
 
 Signal Double Ratchet требует обоих участников online для key exchange. В DTN это невозможно.
 
-**Адаптация — Offline Double Ratchet (требует отдельной спецификации до реализации):**
+**Адаптация — Offline Double Ratchet:**
 
 ```rust
 pub struct OfflineRatchet {
@@ -518,20 +517,15 @@ pub struct OfflineRatchet {
 
 impl OfflineRatchet {
     /// Инициация сессии (отправитель offline)
-    /// GATE: только для контактов в статусе Known (фаза 2 SBP, §2.2)
-    pub fn init_session(&mut self, recipient: &Contact) -> Result<Session> {
-        // 0. Контакт обязан быть Known — иначе Err(NotKnown)
-        if recipient.trust_level == TrustLevel::Unknown {
-            return Err(SessionError::NotKnown);
-        }
+    pub fn init_session(&mut self, recipient_pubkey: &PubKey) -> Session {
         // 1. Получаем один из pre-keys получателя из сети
-        let pre_key = self.network.find_pre_key(recipient.pubkey);
+        let pre_key = self.network.find_pre_key(recipient_pubkey);
         // 2. X3DH handshake с использованием pre-key
         let shared = x3dh(self.identity_key, pre_key);
         // 3. Инициализируем root_key и sending_chain
         Session::new(shared)
     }
-
+    
     /// Отправка сообщения (получатель offline)
     pub fn encrypt(&mut self, session: &mut Session, plaintext: &str) -> EncryptedMessage {
         let msg_key = session.sending_chain.advance();
@@ -543,7 +537,7 @@ impl OfflineRatchet {
             ciphertext,
         }
     }
-
+    
     /// Расшифровка (получатель получил bundle)
     pub fn decrypt(&mut self, msg: &EncryptedMessage) -> String {
         // Восстанавливаем receiving_chain по ephemeral_dh
@@ -553,19 +547,13 @@ impl OfflineRatchet {
 }
 ```
 
-**Ключи подписи и ключи согласия.** Для X25519/ECDH используется отдельный X25519-ключ, подписанный Ed25519-ключом идентичности (или конвертация Ed25519→X25519 по стандартной формуле). Ed25519-ключ сам по себе для ECDH не используется.
-
-**MITM-оговорка (первый контакт):** обмен pubkey на фазе 1 SBP (§2.2) неаутентифицирован — активный MITM может подменить ключи. Доверие к fingerprint собеседника устанавливается out-of-band: сравнение fingerprint по QR при личной встрече (Safety Number). Это сравнение **и есть** доверие; без него первый контакт защищён только от пассивного наблюдателя.
-
 **Pre-key distribution:**
 - Каждый узел генерирует 100 одноразовых pre-keys.
 - Pre-keys рассылаются в сеть как часть contact-info bundle (TTL = 30 дней, copies = spray_max).
 - При исчерпании pre-keys — генерируются новые и рассылаются.
 
-**Pre-keys и gate на Unknown:** публичный pre-key даёт возможность установить E2E-сессию, но **не право доставки**. Первый bundle от контакта в статусе Unknown принимается в **silent inbox** (§5.6), не в основной чат.
-
 **Pre-keys и FSM:**
-- При FSM `silent`, `degraded`, `quarantined` — публикация новых pre-keys прекращается.
+- При FSM `degraded`, `silent`, `quarantined` — публикация новых pre-keys прекращается.
 - Старые pre-keys истекают и не обновляются — отправитель не может начать новый session.
 - Это автоматически ограничивает коммуникацию без дополнительного механизма.
 
@@ -584,22 +572,22 @@ impl OfflineRatchet {
 | Session | ✅ Lokinet | ❌ | ⚠️ onion routing | ✅ | ❌ |
 | Briar | ❌ P2P | ⚠️ только online P2P | ✅ | ✅ | ✅ |
 | Berty | ❌ P2P | ⚠️ только online P2P | ✅ | ✅ | ✅ |
-| **MUSH** | ❌ **нет** | ✅ **store-carry-forward** | ⚠️ **onion — дорожная карта; сейчас EID/размер/время видимы (§2.1)** | ✅ | ✅ |
+| **Mush** | ❌ **нет** | ✅ **store-carry-forward** | ✅ **onion + padding + cover** | ✅ | ✅ |
 
-**MUSH — первый мессенджер, который работает без сети и без серверов одновременно.**
+**Mush — первый мессенджер, который работает без сети и без серверов одновременно.**
 
 ---
 
 ## 5. Спам: структурно затруднён, CUSUM-детекция, иммунитет — последний рубеж
 
-**MUSH не делает спам невозможным. MUSH делает его дорогим и осознанным. Если спам прорывается — срабатывают прикладные спам-сенсоры S1–S7 (ATTACK-MODEL §18) и иммунная FSM с тихим режимом.**
+**MyceRus не делает спам невозможным. MyceRus делает его дорогим и осознанным. Если спам прорывается — срабатывает иммунитет с CUSUM-детекцией и тихим режимом.**
 
 ### 5.1. Формула: Структура → Сенсоры (CUSUM) → Иммунитет (FSM + тихий режим)
 
 ```
-Структурные барьеры (QR + SBP-handshake + грибница)
+Структурные барьеры (QR + SNS-handshake + грибница)
         ↓
-Если прорвался → Сенсоры S1–S7 (CUSUM-накопление, не порог)
+Если прорвался → Сенсоры (CUSUM-накопление, не порог)
         ↓
 Тихий режим (silent) → FSM эскалация → Quarantine
         ↓
@@ -611,23 +599,19 @@ impl OfflineRatchet {
 | # | Вектор | Как работает | Поверхность атаки |
 |---|--------|-------------|-------------------|
 | 1 | **Компрометация существующего контакта** | Контакт Боба захвачен. Атакующий отправляет спам всем, кто знает Боба. | Утечка ключа Боба, side-channel экстракция. |
-| 2 | **Accept-bundle flooding** | После SBP-handshake атакующий отправляет легитимные accept-bundle'ы на десятки ключей, полученных из утечки. | Нарушение контракта: accept-bundle должен следовать за реальным физическим обменом. |
+| 2 | **Accept-bundle flooding** | После SNS-handshake атакующий отправляет легитимные accept-bundle'ы на десятки ключей, полученных из утечки. | Нарушение контракта: accept-bundle должен следовать за реальным физическим обменом. |
 | 3 | **Channel invitation spam** | Владелец грибницы рассылает приглашения в канал всем, кого может достать. | Приглашение — это bundle. Массовая рассылка приглашений = спам. |
 | 4 | **Fruiting Gateway abuse** | Владелец грибницы рассылает сообщения участникам своего канала. | Грибница = точка концентрации. Модератор злоупотребляет relay. |
 | 5 | **Relay poisoning** | Скомпрометированный relay-узел модифицирует bundle'ы при пересылке. | Relay не должен трогать payload. |
 | 6 | **Contact list poisoning** | Атакующий "засеивает" контакт-лист жертвы ложными accept-bundle'ами. | Нарушение контракта двухфазного SBP. |
 
-### 5.3. Шесть спам-специфичных сенсоров (CUSUM) — прикладной уровень
-
-> Сенсоры S1–S7 — **прикладной уровень** MUSH (спам в мессенджере), см. ATTACK-MODEL §18. **11 сетевых сенсоров** (SNSAnomaly, BeaconConsistency, GradientVelocity, E2ETracking, ResourcePressure, HandshakeRate, ContactQuality, QuorumConsistency, TimeConsistency, FitnessPlausibility, PoolDiversity) — сетевой уровень Mycerus, см. ATTACK-MODEL §7 и этапы 19–19A ТЗ.
+### 5.3. Шесть спам-специфичных сенсоров (CUSUM)
 
 Все сенсоры работают на **CUSUM** (Cumulative Sum) — накопление отклонения, а не пороговый срез. Это критично в DTN, где нет real-time потока.
 
 ```rust
 /// CUSUM-детектор: накапливает отклонение от baseline
-/// Параметры k, h — НЕ из генома: whitelist мутируемых полей GENOME-SPEC §8
-/// их не содержит. Дефолты задаются ATTACK-MODEL; (k, h) — кандидат на
-/// immune-блок генома (этап 22), сейчас — фиксированные значения.
+/// Параметры из Vironet-genoma (могут мутировать под среду)
 pub struct CUSUMSensor {
     baseline_rate: f64,              // медиана msg/контакт от этого ключа
     k: f64,                          // slack (минимальное отклонение для накопления)
@@ -641,7 +625,7 @@ impl CUSUMSensor {
         let deviation = observed - self.baseline_rate;
         self.cusum_pos = (self.cusum_pos + deviation - self.k).max(0.0);
         self.cusum_neg = (self.cusum_neg - deviation - self.k).max(0.0);
-
+        
         if self.cusum_pos > self.h {
             Some(Alarm::HighActivity { score: self.cusum_pos })
         } else if self.cusum_neg > self.h {
@@ -655,17 +639,17 @@ impl CUSUMSensor {
 
 | Сенсор | Что измеряет | CUSUM-параметр | Примечание |
 |--------|-------------|----------------|------------|
-| **ContactRateSensor (S1)** | Частота сообщений от одного контакта | `observed = msg_per_contact` | Бaseline пересчитывается при каждом контакте. Одиночные всплески не срабатывают — нужно накопление. |
-| **ContentDiversitySensor (S2)** | Дубликаты сообщений | `observed = duplicate_ratio` | Одинаковые сообщения (copy-paste) накапливают отклонение быстрее, чем уникальные. |
-| **AcceptRequestSensor (S3)** | Частота accept-bundle'ов | `observed = accepts_per_window` | Аномалия: ключ принимает больше контактов, чем исторически. |
-| **InvitationRateSensor (S4)** | Частота приглашений в каналы | `observed = invites_per_window` | Применяется к Fruiting Gateway (кто рассылает). |
-| **RecipientDiversitySensor (S5)** | Число уникальных получателей | `observed = unique_recipients_per_window` | Требует gossip-аттестаций (см. ниже). |
-| **GribnitsaReputationSensor (S6)** | Репутация грибницы-хоста | `observed = complaint_ratio` | Участники канала голосуют "доверие/недоверие" грибнице. |
+| **ContactRateSensor** | Частота сообщений от одного контакта | `observed = msg_per_contact` | Бaseline пересчитывается при каждом контакте. Одиночные всплески не срабатывают — нужно накопление. |
+| **ContentDiversitySensor** | Дубликаты сообщений | `observed = duplicate_ratio` | Одинаковые сообщения (copy-paste) накапливают отклонение быстрее, чем уникальные. |
+| **AcceptRequestSensor** | Частота accept-bundle'ов | `observed = accepts_per_window` | Аномалия: ключ принимает больше контактов, чем исторически. |
+| **InvitationRateSensor** | Частота приглашений в каналы | `observed = invites_per_window` | Применяется к Fruiting Gateway (кто рассылает). |
+| **RecipientDiversitySensor** | Число уникальных получателей | `observed = unique_recipients_per_window` | Требует gossip-аттестаций (см. ниже). |
+| **GribnitsaReputationSensor** | Репутация грибницы-хоста | `observed = complaint_ratio` | Участники канала голосуют "доверие/недоверие" грибнице. |
 
 **Почему CUSUM:**
 - В DTN bundle уже в пути — real-time блокировка невозможна.
-- CUSUM реагирует на **накопленное отклонение**, а не на мгновенный скачок (защита от threshold gaming, атака B5 — ATTACK-MODEL).
-- Параметры (k, h) фиксированы по ATTACK-MODEL; вынос их в геном (immune-блок генома) — кандидат на этап 22, не раньше.
+- CUSUM реагирует на **накопленное отклонение**, а не на мгновенный скачок.
+- Параметры (k, h) могут быть эволюционными (Vironet мутирует их под среду).
 
 ### 5.4. DTN-специфика спам-детекции
 
@@ -677,61 +661,50 @@ impl CUSUMSensor {
 
 ### 5.5. Разделение evidence: Verifiable vs Reputational
 
-> Каноническое правило — ATTACK-MODEL §2/§14. **Текущий режим — reputation + quorum; цель — verifiable-only.**
-
 | Тип | Что это | Пример | Как используется |
-|-----|---------|--------|------------------|
-| **Verifiable** | Объективные факты, верифицируемые третьей стороной | Probe-бандлы с известным dst, подписанные onion/e2e-отчёты, accept-flooding с наблюдаемыми bundle'ами | Формирует `Threat`-утверждение с `evidence_hash`. |
-| **Reputational** | Статистические обвинения, напрямую не проверяемые | CUSUM-накопление, «это спам» (кнопка «пожаловаться») | Не изолирует узел само по себе; накапливает strikes. |
+|-----|---------|--------|----------------|
+| **Verifiable** | Объективные факты, верифицируемые любым узлом | Частота сообщений, дубликаты, accept-flooding | Формирует `Threat`-bundle с `evidence_hash`. Quarantine только на verifiable evidence. |
+| **Reputational** | Субъективное мнение пользователя | "Это спам" (кнопка "пожаловаться") | Не вызывает quarantine. Накапливает strike в таблице репутации. При ≥N strike'ов — сенсор теряет вес. |
 
-**Правило силы доказательств (канон):**
-- **`quarantined` — на verifiable evidence ИЛИ на кворуме N≥3 с reputational evidence** (ATTACK-MODEL §14). Не «только verifiable» — это целевая модель, текущая — reputation+quorum.
-- `watch`/`degraded`/`silent` — допустимы на reputational evidence с кворумом N=2 (топологически независимые сенсоры).
-- **Апелляции — только против verifiable quarantine** (ATTACK-MODEL §13.2): сенсор/узел оспаривает strike, предъявив доказательства независимости; кворум с повышенным порогом N=3.
+**Принцип:** Quarantine — это тяжёлое решение. Оно требует **verifiable evidence**. "Мне не нравится" — это reputational evidence, оно не может изолировать узел.
 
-### 5.6. Trust FSM — шесть состояний (канон — ATTACK-MODEL §8)
+### 5.6. Тихий режим (Silent Mode) в FSM
 
-Канонический Trust FSM Mycerus (trusted → watch → silent → degraded → quarantined → probation) для DTN мягче классического: bundle уже в пути, резкая блокировка бесполезна.
+Традиционный FSM: `trusted → watch → degraded → quarantined`. В DTN это слишком резко — bundle уже в пути.
+
+**Расширенный FSM для спам-контактов:**
 
 ```
-trusted ──► watch ──► silent ──► degraded ──► quarantined ──► probation
-              │          │           │                              │
-              └──────────┴───────────┘                              │
-                 (ручной сброс пользователем)                       │
-                              ▲◀──────── истечение probation, чистая история
-                              └────────────── (полное восстановление)
+trusted ──► watch ──► silent ──► degraded ──► quarantined
+              │          │           │
+              └──────────┴───────────┘
+                 (ручной сброс пользователем)
 ```
 
-- **trusted**: полное участие.
-- **watch**: один сенсор с rep>0 поднял тревогу. Логирование, без ограничений. TTL: часы. Пользователь не замечает.
-- **silent**: мягкое состояние. Bundle'ы от контакта **принимаются**, но **не показываются** пользователю — лежат в теневом inbox (можно заглянуть и восстановить). В альтернативной конфигурации — приём с понижением приоритета. Сюда же попадает первый bundle от контакта **Unknown** (§2.2, §3).
-- **degraded**: кворум N=2 топологически независимых сенсора. Каноническое действие: **пауза relay, игнор gradient'ов, снижение copies**. «Сообщения доходят медленнее» — это **наблюдаемое следствие** этих мер, а не определение состояния.
-- **quarantined**: повторный кворум (новые сигналы) или verifiable evidence. Полная изоляция. Узел-источник — по **ключу**, не по payload (invariant Immune Block 202).
-- **probation**: после истечения TTL quarantine. Ограниченное участие, усиленный мониторинг. При чистой истории — возврат в trusted.
-
-**Bridge-hostage guard** (degraded/quarantined для local bridge) — см. ATTACK-MODEL §8.1: forced degraded + rerouting campaign (Immune Block subtype 4) вместо немедленной изоляции.
+- **watch**: логирование, без ограничений. Пользователь не замечает.
+- **silent**: bundle'ы от контакта **принимаются**, но **не показываются** пользователю. Они лежат в теневом inbox. Пользователь может заглянуть и восстановить.
+- **degraded**: relay-приоритет снижен. Сообщения доходят, но медленнее.
+- **quarantined**: полный отказ в relay. Уже принятые bundle'ы остаются.
 
 **Эскалация:**
 - ContactRateSensor CUSUM срабатывает → `watch`.
 - CUSUM продолжает накапливать → `silent` (тихий режим).
 - Кворум сенсоров подтверждает → `degraded`.
-- Повторный кворум или verifiable evidence → `quarantined`.
+- Повторный кворум + bridge-guard проверка → `quarantined`.
 
 **Апелляция:**
 - Пользователь может вручную перевести контакт из `silent` обратно в `trusted`.
 - Это сбрасывает CUSUM-накопление для этого контакта на этом узле.
 - Другие узлы не знают об апелляции — их CUSUM не сбрасывается.
-- Против verifiable quarantine — формальная апелляция по ATTACK-MODEL §13.2 (кворум N=3).
 
 ### 5.7. Пользовательский UX при спаме
 
 | Сценарий | Что видит пользователь |
 |----------|----------------------|
 | Контакт в `watch` | Ничего. Фоновое логирование. |
-| Контакт в `silent` | **Явный индикатор:** "Контакт X: 3 сообщения скрыты (подозрение на аномалию). [Показать] [Блокировать]". При первом скрытии — уведомление: "MUSH временно скрыл сообщения от X. Проверить?". |
-| Контакт в `degraded` | Красный индикатор (🔴 "контакт ограничен сетью: relay приостановлен"). Задержки доставки — следствие мер против узла, а не «медленный контакт». |
+| Контакт в `silent` | **Явный индикатор:** "Контакт X: 3 сообщения скрыты (подозрение на аномалию). [Показать] [Блокировать]". При первом скрытии — уведомление: "Mush временно скрыл сообщения от X. Проверить?". |
+| Контакт в `degraded` | Красный индикатор (🔴 "контакт ограничен"). Сообщения приходят с задержкой. |
 | Контакт в `quarantined` | "Контакт временно заблокирован сетью". Можно разблокировать вручную. |
-| Контакт в `probation` | Индикатор восстановления: "Контакт X на испытательном сроке, мониторинг усилен". |
 | Кнопка "пожаловаться" | Пользователь нажимает → генерируется reputational evidence (не quarantine). Увеличивает strike count. |
 | **Опция "Не скрывать"** | В настройках: "При подозрении — только предупреждать, не скрывать сообщения". Тогда `silent` → `watch` + уведомление. |
 
@@ -743,7 +716,7 @@ trusted ──► watch ──► silent ──► degraded ──► quarantine
 
 **Лог иммунной активности (для продвинутых):**
 ```
-[14:32] ContactRateSensor (S1): Боб (key: abc123) — CUSUM превышен (score: 3.2)
+[14:32] ContactRateSensor: Боб (key: abc123) — CUSUM превышен (score: 3.2)
 [14:35] Контакт переведён в silent mode (теневой inbox)
 [14:40] Пользователь заглянул в теневой inbox, восстановил контакт
 [14:40] CUSUM сброшен для Боба на этом устройстве
@@ -753,9 +726,9 @@ trusted ──► watch ──► silent ──► degraded ──► quarantine
 
 | Контрмера | Когда | Как |
 |-----------|-------|-----|
-| **Accept-bundle throttle** | AcceptRequestSensor (S3) срабатывает | Лимит на число accept'ов от одного ключа за окно (например, 1/час). |
-| **Channel mute** | InvitationRateSensor (S4) срабатывает | Возможность "заглушить" канал (не показывать уведомления, но оставаться участником). |
-| **Rate limiting** | ContactRateSensor (S1) срабатывает | Снижение приоритета bundle'ов от спамера в очереди relay. |
+| **Accept-bundle throttle** | AcceptRequestSensor срабатывает | Лимит на число accept'ов от одного ключа за окно (например, 1/час). |
+| **Channel mute** | InvitationRateSensor срабатывает | Возможность "заглушить" канал (не показывать уведомления, но оставаться участником). |
+| **Rate limiting** | ContactRateSensor срабатывает | Снижение приоритета bundle'ов от спамера в очереди relay. |
 
 ### 5.9. Граница: что иммунитет не делает
 
@@ -763,7 +736,6 @@ trusted ──► watch ──► silent ──► degraded ──► quarantine
 - **Не блокирует первое сообщение.** Контакт в `silent` — это не блокировка, это скрытие. Пользователь всегда может заглянуть.
 - **Не действует глобально.** Каждый узел решает локально. Глобальный вердикт — роскошь, не необходимость.
 - **Не заменяет человеческое решение.** Пользователь всегда может вручную заблокировать или разблокировать.
-- **Не бьёт по payload.** Санкции накладываются на ключ узла (Immune Block 202, ATTACK-MODEL §6), сообщения не помечаются.
 
 ---
 
@@ -776,34 +748,30 @@ trusted ──► watch ──► silent ──► degraded ──► quarantine
 | **Публичные каналы** | Если они есть — как их найти? | Каталог грибниц через web-of-trust. Не глобальный поиск, а «каналы, которые рекомендуют мои контакты». Это как в раннем интернете — ссылки, а не поисковик. |
 | **Форк канала** | Участник недоволен модерацией и хочет свой канал с той же историей. | CRDT-состояние переносится. Участник fork'ает канал на своей грибнице с полной историей. Старые участники могут перейти или остаться. |
 | **Потеря грибницы-хоста** | Владелец выключил узел, канал исчез. | Участники могут голосовать за новый хост (CRDT-операция). Или участник с полной историей (последний sync) поднимает новую грибницу. |
-| **Позднее присоединение к ad-hoc группе** | Новый участник хочет войти после создания. | QR группы от любого текущего участника (содержит group_key + свободный sender_id от allocator'а) либо key rotation создателем. Схема координации nonce — MUSH-A'-SPEC §4.1. |
 
 ---
 
 ## 7. Что нужно доработать в Mycerus
 
-Фактическое состояние Mycerus по иммунным этапам: Immune Block 202 (каркас: Threat/Quarantine/Revoke/Reroute, revocation-лист) — **реализован этапом 18** (ТЗ); подпись e2e-отчётов ReportE2EDelivery (Ed25519 над bundle_id, dst, delivered_at, receiver_key) — **реализована этапом 18**; сенсорный фреймворк и 11 сетевых сенсоров — **этап 19/19A** (фреймворк — 19A). Остальное immune plane — этапы 20–22 (response protocol, attack harness, immune memory).
-
-| Доработка | Приоритет | Статус / этап | Описание |
-|-----------|-----------|---------------|----------|
-| **Onion wrapper поверх MEB** | 🔴 Высокий | После 22 + MEB v2 | Шифрование/сокрытие MEB-хинтов per-hop. **Открытый вопрос:** gradient routing требует видимого destination (§2.1) — требуется MEB-SPEC v0.2 и новое решение маршрутизации. |
-| **Padding bundle** | 🔴 Высокий | После 22 + MEB v2 | Фиксированные размеры (1K/4K/16K) для всех payload'ов. |
-| **Cover traffic generator** | 🟡 Средний | После 22 + MEB v2 | Фоновые dummy bundle'ы, неотличимые от реальных. Только при питании/зарядке. |
-| **CRDT Chat Store** | 🔴 Высокий | MUSH-side | OR-Map + LWW для истории сообщений. Merge при получении. |
-| **Fruiting Gateway protocol** | 🔴 Высокий | MUSH-side | Протокол хостинга каналов: приём клиентов, relay, CRDT-snapshot, модерация. |
-| **Group CRDT protocol** | 🟡 Средний | MUSH-side | OR-Set для участников, key rotation, chunk-based sync, accept-bundle. |
-| **Spore Bundle Protocol (SBP)** | 🟡 Средний | MUSH-side | Формат encrypted snapshot для backup, multi-device и двухфазного контакта. |
-| **Offline Double Ratchet** | 🔴 Высокий | Требует отдельной спеки | X3DH + pre-keys + chain-based key derivation для DTN. |
-| **Pre-key distribution** | 🟡 Средний | MUSH-side | Распространение одноразовых pre-keys через Mycerus mesh. Gate: Known-only (§3). |
-| **Privacy-aware MEB hints** | 🟡 Средний | Открытый вопрос | Замена точных destination_affinity на privacy_zone — несовместима с gradient routing; требует MEB v2 (§2.1). |
-| **ContactRateSensor (S1)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: частота сообщений от одного контакта. Baseline адаптивный. |
-| **ContentDiversitySensor (S2)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: дубликаты сообщений. |
-| **AcceptRequestSensor (S3)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: частота accept-bundle'ов. |
-| **InvitationRateSensor (S4)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: приглашения в канал от Fruiting Gateway. |
-| **RecipientDiversitySensor (S5)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: число уникальных получателей. Требует gossip-аттестаций. |
-| **GribnitsaReputationSensor (S6)** | 🟡 Средний | Прикладной, ATTACK-MODEL §18 | CUSUM: репутация грибницы. |
-| **MUSH Payload Block (тип 203)** | 🟢 Низкий | Зарезервирован | Регистрация типа блока в BPv7 для MUSH сообщений; требует отдельной спецификации (payload_type enum — предварительно). |
-| **Сенсорный фреймворк + 11 сетевых сенсоров** | 🔴 Высокий | Этап 19/19A (сетевой уровень, ATTACK-MODEL §7) | MAD-baseline + CUSUM-накопители. |
+| Доработка | Приоритет | Статус | Описание |
+|-----------|-----------|--------|----------|
+| **Onion wrapper поверх MEB** | 🔴 Высокий | Новое | Шифрование MEB-хинтов per-hop. Relay-узлы не видят destination. |
+| **Padding bundle** | 🔴 Высокий | Новое | Фиксированные размеры (1K/4K/16K) для всех payload'ов. |
+| **Cover traffic generator** | 🟡 Средний | Новое | Фоновые dummy bundle'ы, неотличимые от реальных. |
+| **CRDT Chat Store** | 🔴 Высокий | Новое | OR-Map + LWW для истории сообщений. Merge при получении. |
+| **Fruiting Gateway protocol** | 🔴 Высокий | Новое | Протокол хостинга каналов: приём клиентов, relay, CRDT-snapshot, модерация. |
+| **Group CRDT protocol** | 🟡 Средний | Новое | OR-Set для участников, key rotation, chunk-based sync, accept-bundle. |
+| **Spore Bundle Protocol (SBP)** | 🟡 Средний | Новое | Формат encrypted snapshot для backup, multi-device и двухфазного контакта. |
+| **Offline Double Ratchet** | 🔴 Высокий | Новое | X3DH + pre-keys + chain-based key derivation для DTN. |
+| **Pre-key distribution** | 🟡 Средний | Новое | Распространение одноразовых pre-keys через Mycerus mesh. |
+| **Privacy-aware MEB hints** | 🟡 Средний | Новое | Замена точных destination_affinity на privacy_zone. |
+| **ContactRateSensor (S1)** | 🟡 Средний | Новое | CUSUM: частота сообщений от одного контакта. Baseline адаптивный. |
+| **ContentDiversitySensor (S2)** | 🟡 Средний | Новое | CUSUM: дубликаты сообщений. Copy-paste накапливает быстрее уникальных. |
+| **AcceptRequestSensor (S3)** | 🟡 Средний | Новое | CUSUM: частота accept-bundle'ов. Аномалия = больше контактов, чем исторически. |
+| **InvitationRateSensor (S4)** | 🟡 Средний | Новое | CUSUM: приглашения в канал от Fruiting Gateway. |
+| **RecipientDiversitySensor (S5)** | 🟡 Средний | Новое | CUSUM: число уникальных получателей. Требует gossip-аттестаций. |
+| **GribnitsaReputationSensor (S6)** | 🟡 Средний | Новое | CUSUM: репутация грибницы. Участники голосуют доверие/недоверие. |
+| **Mush Payload Block (тип 203)** | 🟢 Низкий | Новое | Регистрация типа блока в BPv7 для Mush сообщений. |
 
 ---
 
@@ -811,78 +779,88 @@ trusted ──► watch ──► silent ──► degraded ──► quarantine
 
 | Ограничение | Почему так | Как митигация |
 |-------------|-----------|---------------|
-| **Задержка** | Store-carry-forward = eventual delivery. Сообщение может прийти через секунды, часы или дни. | Позиционирование: "гарантированная доставка" — неверно; "высокая вероятность доставки до истечения TTL". Приоритетные сообщения (SOS) получают spray_max + highest priority. |
+| **Задержка** | Store-carry-forward = eventual delivery. Сообщение может прийти через секунды, часы или дни. | Позиционирование: "гарантированная доставка", не "мгновенная". Приоритетные сообщения (SOS) получают spray_max + highest priority. |
 | **Группы = инфраструктура** | Нет чужого сервера = хочешь группу, поднимай свою грибницу (Fruiting Gateway). Это требует ресурсов и ответственности. | Грибница-хост = выделенный узел. Участники синхронизируются при контакте. Хост модерирует relay, но не может подделать историю (CRDT + подписи). Fork канала возможен. |
 | **Мульти-устройство** | Нет облака = sync через споры. Новое устройство подбирает snapshot из сети. | Spore с высоким TTL (7 дней), явное "добавление устройства" через QR-код (как добавление контакта, но для себя). |
-| **Метаданные** | Факт встречи двух узлов виден. Onion скрывает маршрут, но не факт контакта. **В текущей сети onion нет** — посредник видит EID источника/назначения, размер, время (§2.1). | Cover traffic делает факт контакта неопределённым (встреча могла быть для dummy). Полное сокрытие метаданных — после этапа 22 + MEB v2. |
-| **Спам** | **Структурно затруднён + иммунитет.** Нет глобального адресного пространства, нет публичных ID. Сообщение только после SBP-handshake. Если спам прорывается (утечка ключей, скомпрометированный контакт) — сенсоры S1–S7 (ATTACK-MODEL §18) и Immune plane (этапы 19–22) детектируют аномалию и применяют точечную контрмеру по ключу узла. | Три уровня: структурный (адресация = разрешение), ресурсный (отправка стоит энергии), иммунный (сенсоры + FSM). |
+| **Метаданные** | Факт встречи двух узлов виден. Onion скрывает маршрут, но не факт контакта. | Cover traffic делает факт контакта неопределённым (встреча могла быть для dummy). |
+| **Спам** | **Структурно затруднён + иммунитет.** Нет глобального адресного пространства, нет публичных ID. Сообщение только по известному адресу после SNS-handshake. Если спам прорывается (утечка ключей, скомпрометированный контакт) — Immune plane детектирует аномалию (fan-out, поведение) и применяет точечную контрмеру. | Три уровня: структурный (адресация = разрешение), ресурсный (отправка стоит энергии), иммунный (сенсоры + FSM). |
 | **Батарея** | BLE/WiFi-Direct в фоне = расход. | Energy-aware transport (см. 2.4). Relay-режим опционален. Cover traffic только при зарядке. |
 
 ---
 
 ## 9. Роадmap: от архитектуры к коду
 
-**Синхронизация с Mycerus (иммунные этапы 19–22; см. ТЗ и ATTACK-MODEL §10):**
+**Синхронизация с Mycerus (этапы 17–20):**
 
-| MUSH | Mycerus | Что строим |
+| Mush | Mycerus | Что строим |
 |-----------|---------|-----------|
-| **Этап A'** | Вне скоупа MVP (ТЗ §3.2) | Демо ad-hoc группы: BPv7-lite + hotspot/QR + symmetric crypto + CRDT, без хоста. Параллельный трек; для иммунных функций опирается на этап 19A. Спека: MUSH-A'-SPEC.md |
-| **Этап A** | База: этапы 1–19A | Core: Payload Block (тип 203, после спецификации), Offline Double Ratchet, status tracking (подписанный ReportE2EDelivery — готов, этап 18) |
-| **Этап B** | Этап 20 (Response Protocol) | Vault + Chats + immune UX: SQLCipher, CRDT Chat Store, Identicon, Safety Number, silent inbox, апелляции (ATTACK-MODEL §13.2) |
-| **Этап C** | После этапа 22 + MEB v2 | Onion + Transport: per-hop wrapper, padding, cover traffic, BLE adapter. Заблокировано открытым вопросом §2.1 (маршрутизация без видимого destination) |
-| **Этап D** | Этап 21 (Attack harness) | Groups + Fruiting Gateway + harness-сценарии J/K/L (спам-векторы §5.2 как вакцинация) |
-| **Этап E** | Этап 22 (Immune memory) | Resilient: интеграция immune memory, immune-блок генома (CUSUM k,h — кандидат), stress-test, audit |
+| **Этап A'** | — | Ad-hoc группа: BPv7 + WiFi-Direct + CRDT, без хоста |
+| **Этап A** | Этап 17 (Sensors) | Core: Payload Block, Double Ratchet, MEB hints, status tracking |
+| **Этап B** | Этап 18 (Response Protocol) | Vault + Chats: SQLCipher, CRDT Chat Store, Identicon, Safety Number |
+| **Этап C** | Этап 18 (Response Protocol) | Onion + Transport: per-hop wrapper, padding, cover traffic, BLE adapter |
+| **Этап D** | Этап 19 (Attack harness) | Groups + Fruiting Gateway: хостинг, group CRDT, SBP, backup |
+| **Этап E** | Этап 20 (Immune memory) | Resilient: Immune plane integration, Vironet, stress-test, audit |
 
-### Этап A'. Ad-hoc группа (2 недели) — демо-прототип, вне скоупа MVP
+### Этап A'. Ad-hoc группа (2 недели) — первый прототип
 
 **Зачем:** проверить базовый UX DTN-мессенджера до добавления сложности. Если два телефона в одной комнате не могут удобно переписываться — immune plane не спасёт.
 
-- [ ] Ad-hoc группа: CRDT-чат без хоста, QR-обмен ключами (спека — MUSH-A'-SPEC.md)
-- [ ] Hotspot transport для Android (fallback — BLE)
-- [ ] Базовый UI: список сообщений, ввод, статус "доставлено"
+**Промежуточный шаг — Rust CLI:**
+- Сначала: Rust CLI прототип (`cargo run`) — проверка handshake, CRDT sync, sensors, framing.
+- Затем: Kotlin Android Studio — тот же protocol, нативный UI, Hotspot API, QR-камера.
+- Контракт: protocol не меняется, только transport (TCP → Hotspot) и UI (TUI → Compose).
+
+**Rust CLI (MUSH-A'-CLI-SPEC.md):**
+- [ ] TCP transport (вместо Hotspot)
+- [ ] `mush://` invite string в stdout (вместо QR)
+- [ ] TUI или stdin/stdout UI
+- [ ] SNS handshake, CRDT sync, sensors — идентично Android
+- [ ] `cargo test` для crypto, CRDT, sensor logic
+
+**Kotlin Android (MUSH-A'-SPEC.md):**
+- [ ] Ad-hoc группа: CRDT-чат без хоста, QR-обмен ключами
+- [ ] Hotspot transport для Android
+- [ ] Jetpack Compose UI: список сообщений, ввод, статус "доставлено"
 - [ ] **Демо:** 2–4 телефона в одной комнате, групповой чат без интернета и сервера
 
-**Чего НЕТ в этом этапе:** Fruiting Gateway, Immune plane, Vironet, Onion, Double Ratchet, Spores. Только plain BPv7 + symmetric key + CRDT. Это **не продукт и не часть MVP Mycerus** — ТЗ §3.2.
+**Чего НЕТ в этом этапе:** Fruiting Gateway, Immune plane, Vironet, Onion, Double Ratchet, Spores. Только bundle framing + symmetric key + CRDT.
 
-### Этап A. MUSH Core (4 недели) → база: этапы 1–19A
-- [ ] MUSH Payload Block (тип 203) — после отдельной спецификации
-- [ ] Offline Double Ratchet (X3DH + pre-keys) — после отдельной спецификации
-- [ ] MEB по MEB-SPEC v0.1.2 §4 (без privacy-aware модификаций — см. §2.1)
-- [ ] Message status tracking (⏳ / ✓ / ✓✓) через SRE receipts + подписанный ReportE2EDelivery (реализован этапом 18)
+### Этап A. Mush Core (4 недели) → Mycerus 17
+- [ ] Mush Payload Block (тип 203) в BPv7
+- [ ] Offline Double Ratchet (X3DH + pre-keys)
+- [ ] Privacy-aware MEB hints (privacy_zone вместо destination_affinity)
+- [ ] Message status tracking (⏳ / ✓ / ✓✓) через SRE receipts
 - [ ] **Демо:** два телефона, WiFi-Direct, текст, QR-контакты
 
-### Этап B. MUSH Vault + Chats + immune UX (4 недели) → Mycerus 20
+### Этап B. Mush Vault + Chats (4 недели) → Mycerus 18
 - [ ] SQLCipher store для сообщений
 - [ ] CRDT Chat Store (OR-Map + LWW)
 - [ ] Identicon generation
 - [ ] Safety Number verification
-- [ ] Silent inbox UX (§5.6/§5.7) + апелляции (ATTACK-MODEL §13.2)
-- [ ] **Демо:** история сообщений, offline доставка, immune UX при спаме
+- [ ] **Демо:** история сообщений, offline доставка, read receipts
 
-### Этап C. MUSH Onion + Transport (4 недели) → после 22 + MEB v2
-- [ ] Onion wrapper per-hop — **заблокировано открытым вопросом §2.1**
+### Этап C. Mush Onion + Transport (4 недели) → Mycerus 18
+- [ ] Onion wrapper per-hop
 - [ ] Padding до фиксированных размеров
-- [ ] Cover traffic generator (только при зарядке)
+- [ ] Cover traffic generator
 - [ ] BLE transport adapter
 - [ ] Energy-aware switching
 - [ ] **Демо:** 3+ hop'а через mesh, метаданные скрыты
 
-### Этап D. MUSH Groups + Fruiting Gateway (4 недели) → Mycerus 21
+### Этап D. Mush Groups + Fruiting Gateway (4 недели) → Mycerus 19
 - [ ] Fruiting Gateway protocol (хостинг каналов)
 - [ ] Group CRDT protocol + accept-bundle
 - [ ] Key rotation для групп
 - [ ] Spore Bundle Protocol (SBP) для backup и multi-device
-- [ ] Harness-сценарии J/K/L: векторы спама §5.2 как вакцинация (этап 21)
 - [ ] **Демо:** групповой чат 5 человек на Fruiting Gateway, backup/restore
 
-### Этап E. MUSH Resilient (4 недели) → Mycerus 22
-- [ ] Интеграция Immune plane (тип 202) — CUSUM-сенсоры S1–S6 (прикладной уровень, ATTACK-MODEL §18), тихий режим; сетевые сенсоры — этапы 19–19A
-- [ ] Интеграция Immune memory (этап 22); CUSUM (k, h) — кандидат на immune-блок генома
+### Этап E. Mush Resilient (4 недели) → Mycerus 20
+- [ ] Интеграция Immune plane (тип 202) — CUSUM-сенсоры S1–S6, тихий режим
 - [ ] Интеграция Vironet (адаптивная маршрутизация)
 - [ ] Desktop/Web клиент
-- [ ] Stress-test: 100+ узлов, 24 часа, эмуляция атак
+- [ ] Stress-test: 100+ узлов, 24 часа, эмуляция атак (включая 6 новых атак A5, B5–B6, C6, D6, F5)
 - [ ] Security audit
 
 ---
 
-*Mycerus — это мицелий. MUSH — это ягода. Пользователь видит ягоду. Под землёй — вся сеть, которая делает так, чтобы ягода всегда была.*
+*Mycerus — это мицелий. Mush — это ягода. Пользователь видит ягоду. Под землёй — вся сеть, которая делает так, чтобы ягода всегда была.*

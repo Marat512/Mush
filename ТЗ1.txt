@@ -1,0 +1,132 @@
+Ветка: feat/a1-cli
+Deliverable: cargo run --bin mush-node работает, две ноды на одной машине обмениваются сообщениями, handshake + CRDT sync + sensors проходят 7 критериев из MUSH-A'-CLI-SPEC.md §7.
+Не входит: Android, Kotlin, JNI, QR, Hotspot. Только Rust workspace + CLI.
+
+Структура репо (создать)
+text
+mush/
+├── Cargo.toml              # workspace
+├── mush-core/              # library
+│   └── src/
+│       ├── lib.rs
+│       ├── identity.rs     # Ed25519 keypair, X25519 conversion
+│       ├── crypto.rs       # HKDF, AES-GCM, sign/verify
+│       ├── sns.rs          # handshake (§3.1 MUSH-A'-SPEC)
+│       ├── framing.rs      # [len][type][CBOR]
+│       ├── crdt.rs         # AdHocGroup, ChatMessage, Lamport, merge
+│       ├── sensors.rs      # S1 ContactRate, S7 DecoyEid
+│       ├── inbox.rs        # InboxBuffer (backpressure)
+│       └── transport.rs    # TCP
+├── mush-cli/               # binary
+│   └── src/main.rs         # commands: /send /join /sync /flood /decoy
+└── docs/                   # скопировать MUSH-A'-SPEC.md, MUSH-A'-CLI-SPEC.md
+Конкретные крейты
+toml
+[dependencies]
+ed25519-dalek = "2"
+x25519-dalek = "2"
+rand = "0.8"
+chacha20poly1305 = "0.10"    # для AES-256-GCM — или aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"             # CBOR
+ulid = "1"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+Что делает coding agent по шагам
+Шаг 1 — identity + crypto (полдня)
+
+Identity::generate() — Ed25519 keypair.
+
+to_x25519() — конверсия pubkey/privkey в X25519 через ed25519-dalek::SigningKey::to_scalar_bytes() или libsodium-эквивалент. Проверить тестом: X25519(priv_A, pub_B) == X25519(priv_B, pub_A).
+
+sign(msg) -> Signature, verify(pubkey, msg, sig) -> bool.
+
+Шаг 2 — SNS handshake (полдня)
+
+Реализовать точно по MUSH-A'-SPEC.md §3.1:
+
+ephemeral X25519, nonce 16 байт, Ed25519 sig над ephemeral || nonce || "SNS1".
+
+HKDF-SHA256(shared, salt=nonce_A||nonce_B, info="Mush-SNS-v1").
+
+Тест: два процесса обмениваются, оба получают одинаковый session_key.
+
+Шаг 3 — framing + TCP (полдня)
+
+[4 bytes BE length][1 byte type][CBOR payload].
+
+Типы: 0x01 text, 0x02 sync, 0x03 handshake, 0x04 decoy.
+
+TCP listener на 127.0.0.1:<port>.
+
+Тест: две ноды шлют Ping/Pong CBOR-объекты.
+
+Шаг 4 — CRDT Chat Store (день)
+
+ChatMessage { id: ULID, sender: PubKey, content: Vec<u8>, timestamp: LamportClock, nonce: [u8;12] }.
+
+ChatStore с merge(): дедуп по id, порядок по LamportClock.
+
+Шифрование content на group_key (AES-GCM).
+
+Тест: три ChatStore, разные порядки вставки, после merge — идентичные истории.
+
+Шаг 5 — sensors (полдня)
+
+S1: ContactRateSensor — threshold msg_count > median * 5, окно 10.
+
+S7: DecoyEidSensor — decoy EIDs генерируются blake3(random || pubkey || epoch).
+
+Тест: подать 50 сообщений подряд → S1 alert; отправить на decoy → S7 alert.
+
+Шаг 6 — CLI + TUI (день)
+
+clap для аргументов: --name, --port, --join <invite>.
+
+Commands: /send, /join, /contacts, /sync, /flood N, /decoy, /alert, /quit.
+
+При старте — печатать mush://<base64_pubkey>#<base64_nonce>.
+
+Демо: два терминала, cargo run, копипаст invite, /send hello.
+
+Критерии приёмки (из CLI-SPEC §7)
+✅ Две ноды обмениваются сообщениями
+
+✅ Handshake через mush:// строку
+
+✅ CRDT sync: 3 ноды, идентичная история
+
+✅ S1 детектирует /flood 50
+
+✅ S7 детектирует /decoy
+
+✅ Backpressure: 100+ сообщений → oldest удаляются
+
+✅ cargo test --release проходит, нет паник за 30 мин
+
+Что делать сейчас четко
+
+Реализуй Rust workspace mush/ согласно docs/MUSH-A'-SPEC.md v0.1.1 §3.1, §4, §5, §6 и docs/MUSH-A'-CLI-SPEC.md. Deliverable: cargo run --bin mush-node с командами из CLI-SPEC §2.3. Платформа: Linux/macOS. Не трогать Android, JNI, QR, Hotspot. Криптография: ed25519-dalek, x25519-dalek, hkdf, aes-gcm, ciborium. Тесты: unit для crypto, integration для handshake и CRDT merge, CLI smoke test на 2 портах. Критерии приёмки — CLI-SPEC §7. Коммиты по шагам 1–6. Не расширять scope.
+
+Что проверить после
+X25519 conversion — самое частое место ошибок. Тест DH(A_priv, B_pub) == DH(B_priv, A_pub) обязателен.
+
+Nonce freshness — старый invite должен отклоняться. Добавить тест.
+
+Lamport clock — при merge не должно быть циклов. Проверить на 100+ сообщениях из 3 источников.
+
+Backpressure eviction — не удаляет ли свежие сообщения вместо старых.
+
+Что НЕ делать сейчас
+Не реализовывать evidence_tier — заглушка Hard достаточно.
+
+Не реализовывать FSМ, кворум, quarantine — это этап E.
+
+Не реализовывать Double Ratchet — в A' session_key симметричный.
+
+Не оптимизировать — CRDT на 100 сообщений должен работать, не на миллион.

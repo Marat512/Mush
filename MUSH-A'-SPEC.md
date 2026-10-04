@@ -1,27 +1,37 @@
 # MUSH-A'-SPEC — Минимальный прототип (этап A')
 
-**Версия:** 0.1.0
-**Дата:** 2026-09-29
-**Статус:** Спецификация демо-прототипа; **ПАРАЛЛЕЛЬНЫЙ ТРЕК вне скоупа MVP (ТЗ §3.2)**
-**Гейт:** реализация A' не начинается без явного двухкратного подтверждения владельца (см. MUSH-CONCEPT, шапка)
-**База:** Mycerus MVP (этапы 1–19A) + ATTACK-MODEL v0.5.0
+**Версия:** 0.1.1  
+**Дата:** 2026-09-29  
+**Статус:** Draft — спецификация первого прототипа  
 **Цель:** Два телефона, одна комната, три дня до демо. Проверить гипотезу: «люди готовы сканировать QR вместо регистрации».
+
+---
+
+## Изменения v0.1.0 → v0.1.1
+
+- **§2:** «BPv7 lite» → Bundle framing (простой binary, не претендует на RFC 9171). Interop с Mycerus — этап A.
+- **§3:** SNS-handshake формализован — Ed25519 для подписи, X25519 для DH, nonce 16 байт, tie-break по pubkey.
+- **§5.1:** Hotspot IP не хардкодится. Owner IP зашивается в QR при создании группы.
+- **§5.2:** BLE вырезан из A' (Android 12+ permissions + GATT MTU + fragment'ация — мёртвый груз для 3-дневного прототипа).
+- **§6.1:** ContactRateSensor — честно назван threshold-based для A'. CUSUM отложен до этапа E.
+- **§1, §7:** Shadow inbox вырезан. Заменён на «backpressure на входящих» (обычное ограничение буфера, не FSM).
+- **§8:** Критерий #5 переформулирован — «50 сообщений подряд от одного контакта → alert» (тестируется на 2 телефонах).
 
 ---
 
 ## 1. Что входит в A'
 
-A' — это **не продукт**, это **проверка гипотезы**. Минимальный набор для демо:
+A' — это не продукт, это проверка гипотезы. Минимальный набор для демо:
 
 | Компонент | Что делает | Чего НЕТ |
 |-----------|-----------|----------|
-| **Hotspot transport** | Один телефон поднимает точку доступа, остальные коннектятся | WiFi-Direct P2P (сложно, отложено) |
+| **Hotspot transport** | Один телефон поднимает точку доступа, остальные коннектятся | WiFi-Direct P2P, BLE (сложно, отложено) |
 | **QR + invite-link** | Обмен контактами через QR (офлайн) или ссылку (онлайн) | Ретрансляция, NFC |
 | **CRDT-чат** | Групповой чат без хоста, синхронизация при встрече | Fruiting Gateway, история после расформирования |
 | **Symmetric encryption** | AES-256-GCM с ключом, полученным через QR | Double Ratchet, Onion, pre-keys |
-| **ContactRateSensor (S1)** | Базовый сенсор: медиана msg/контакт, медленный дрейф baseline | CUSUM, тихий режим, immune plane целиком |
+| **ContactRateSensor (S1)** | Threshold-based: `msg_count > median × 5` | CUSUM, тихий режим, immune plane целиком |
 | **DecoyEidSensor (S7)** | Honeypot: фейковые EID в beacon'ах | Остальные сенсоры S2–S6 |
-| **Shadow inbox cap** | 100 сообщений / 7 дней, oldest-first eviction | Тихий режим, FSM |
+| **Backpressure на входящих** | Ограничение буфера: 100 сообщений / 7 дней, oldest-first eviction | Теневой inbox, FSM, silent mode |
 
 ---
 
@@ -44,21 +54,29 @@ A' — это **не продукт**, это **проверка гипотез�
 ├───────┼────────────┼────────────┼───────┤
 │       │            │            │       │
 │  ┌────┴────────────┴────────────┴────┐  │
-│  │         MUSH Core (A')       │  │
-│  │  • BPv7 lite (без extension blocks)│ │
+│  │         Mush Core (A')            │  │
+│  │  • Bundle framing (binary)        │  │
 │  │  • Symmetric crypto (AES-256-GCM) │  │
 │  │  • S1 ContactRateSensor           │  │
 │  │  • S7 DecoyEidSensor              │  │
-│  │  • Shadow inbox cap               │  │
+│  │  • Backpressure on inbox          │  │
 │  └────────────────────────────────────┘  │
 ├─────────────────────────────────────────┤
 │           Transport Layer               │
 │  ┌─────────────────────────────────────┐│
 │  │  Hotspot (WiFi AP) — primary       ││
-│  │  BLE — secondary (опционально)     ││
+│  │  (BLE — НЕ в A')                   ││
 │  └─────────────────────────────────────┘│
 └─────────────────────────────────────────┘
 ```
+
+**Bundle framing (не BPv7 lite):** A' использует простой binary format:
+
+```
+[4 bytes: length][1 byte: type][payload: CBOR]
+```
+
+Это не BPv7. Это Mush wire format для A'. Претензии на RFC 9171 — этап A, когда потребуется interop с Mycerus. Для 2-телефонного демо BPv7 даёт canonical CBOR, EID parsing и 8+ полей primary block — избыточно.
 
 ---
 
@@ -74,25 +92,64 @@ A' — это **не продукт**, это **проверка гипотез�
 4. Готово — можно получать invite или показать QR
    ↓
 5. Добавление контакта:
-      a) Invite-link (основной): ссылка с pubkey + nonce → клик → SBP-handshake
-      b) QR (fallback): сканирование → pubkey exchange → SBP-handshake
+      a) Invite-link (основной): ссылка с pubkey + nonce → клик → SNS-handshake
+      b) QR (fallback): сканирование → pubkey exchange → SNS-handshake
    ↓
 6. Пишем сообщения
 ```
 
-**SBP-handshake в A' (упрощённый):**
-1. A отправляет B свой pubkey + nonce.
-2. B отправляет A свой pubkey + nonce (подписанный).
-3. Оба проверяют подписи, вычисляют shared secret (X25519).
-4. Контакт добавлен, можно писать.
+### 3.1. SNS-handshake в A' — формализация
 
-**Ключи подписи vs ключи согласия:** Ed25519-ключ не используется для ECDH напрямую. Варианты: (а) конвертация Ed25519→X25519 по стандартной формуле (как в libsodium `crypto_sign_ed25519_sk_to_curve25519`) или (б) **отдельный X25519-ключ, подписанный Ed25519-ключом идентичности** (предпочтительно для A': явно и аудируемо). Реализация: при первом запуске генерируются обе пары; X25519-ключ аттестуется self-signature.
+**Ключи:**
 
-**MITM-оговорка (шаг 1):** первый шаг handshake неаутентифицирован — активный MITM может подменить pubkey при первом контакте. Доверие к fingerprint собеседника устанавливается **out-of-band**: сравнение fingerprint по QR при личной встрече (Safety Number). Это сравнение **и есть** доверие; без него первый контакт защищён только от пассивного наблюдателя.
+- Каждый узел генерирует Ed25519 keypair при первом запуске.
+- Для DH Ed25519 pubkey конвертируется в X25519 через бирациональное отображение (стандарт, libsodium `crypto_sign_ed25519_pk_to_curve25519`).
+- Ed25519 private key конвертируется в X25519 private аналогично.
 
-**Терминология:** это SBP-handshake (прикладной уровень, люди). SNS-handshake — аутентификация **узлов** сети Mycerus (challenge-response, ТЗ §9); в A' её нет — демо не использует узловую грибницу.
+**Что передаётся в invite-link / QR:**
 
-**Нет:** phone number, email, username, central server, registration.
+```
+pubkey_ed25519: 32 bytes (base64)
+nonce: 16 bytes random (base64)
+```
+
+**Протокол handshake:**
+
+```
+A (инициатор) → B:
+  ephemeral_A: X25519 public (32 bytes)
+  nonce_A: 16 bytes random
+  sig_A: Ed25519_sign(ephemeral_A || nonce_A || "SNS1") by A's identity key
+
+B → A:
+  ephemeral_B: X25519 public (32 bytes)
+  nonce_B: 16 bytes random
+  sig_B: Ed25519_sign(ephemeral_B || nonce_B || nonce_A || "SNS1") by B's identity key
+
+Оба:
+  shared = X25519(ephemeral_A_priv, ephemeral_B_pub) = X25519(ephemeral_B_priv, ephemeral_A_pub)
+  session_key = HKDF-SHA256(shared, salt=nonce_A || nonce_B, info="Mush-SNS-v1")
+```
+
+**Проверки:**
+
+1. `sig_A` верифицируется по `pubkey_ed25519_A` (получен из QR/invite).
+2. `sig_B` верифицируется по `pubkey_ed25519_B` (получен из handshake).
+3. `nonce_A` из handshake совпадает с nonce из invite-link/QR (защита от replay старого invite).
+4. Nonce не встречался ранее на этом узле (nonce-кэш с TTL 24 часа).
+
+**Tie-break при одновременном сканировании:**
+
+- Если оба узла показывают QR и оба сканируют — инициатором становится тот, чей `pubkey_ed25519` меньше лексикографически.
+- Меньший pubkey → отправляет первый handshake.
+- Больший pubkey → ждёт и отвечает.
+- Это детерминировано и исключает race condition.
+
+**Что НЕ в handshake A':**
+
+- **Double Ratchet** — симметричный session_key, без forward secrecy.
+- **Pre-keys** — нет offline delivery в A'.
+- **Повторный handshake для rekey** — нет, один сеанс на контакт.
 
 ---
 
@@ -102,62 +159,45 @@ A' — это **не продукт**, это **проверка гипотез�
 
 ```rust
 pub struct AdHocGroup {
-    pub group_id: GroupID,               // hash(creator_pubkey || creation_timestamp)
-    pub members: Vec<PubKey>,            // участники (известны при создании)
-    pub sender_ids: HashMap<PubKey, u32>,// sender_id (4 байта), выдан при присоединении
-    pub next_sender_id: u32,             // allocator counter (ведёт создатель)
-    pub messages: Vec<ChatMessage>,      // упорядоченные по Lamport clock
-    pub group_key: SymmetricKey,         // общий ключ (обмен через QR при создании)
+    pub group_id: GroupID,           // hash(creator_pubkey || creation_timestamp)
+    pub members: Vec<PubKey>,        // участники (известны при создании)
+    pub messages: Vec<ChatMessage>,  // упорядоченные по Lamport clock
+    pub group_key: SymmetricKey,     // общий ключ (обмен через QR при создании)
 }
 ```
 
-**Критично — координация nonce для группового AES-256-GCM.** Все участники шифруют на **одном общем** group_key. Повтор nonce на одном ключе = **полная потеря confidentiality и integrity** (GCM). Поэтому nonce не произвольные, а координированные:
-
-```
-nonce (12 байт) = sender_id (4 байта) ‖ per-sender counter (8 байт)
-```
-
-- **`sender_id` (4 байта):** уникальный идентификатор участника, **выдаётся при присоединении** allocator'ом (создатель группы; выдача — вместе с group_key через QR). Не два участника не делят один sender_id.
-- **`counter` (8 байт):** монотонный счётчик сообщений **конкретного отправителя**, начинается с 0, инкремент на каждое отправленное сообщение. У разных отправителей счётчики независимы — коллизий nonce быть не может.
-- **Дедупликация на приёме:** по паре `(sender_id, counter)` (в дополнение к MessageID): сообщение с уже встречавшимся counter от того же sender_id отбрасывается (replay).
-- Отправитель использует **только** свой sender_id; подмена sender_id чужого участника = невалидная подпись/структура сообщения.
-
 **Протокол:**
-1. Создатель генерирует `group_id`, `group_key`, присваивает себе `sender_id = 0`, показывает QR-код.
-2. Участники сканируют QR → получают `group_id` + `group_key` + выданный им `sender_id` (1, 2, 3...).
-3. Сообщение шифруется на `group_key` (AES-256-GCM) с nonce по схеме выше.
-4. При встрече участников — sync: merge сообщений по Lamport clock, дедупликация по MessageID и `(sender_id, counter)`.
 
-**Поздний участник (присоединение после создания):** два варианта:
-- **(а) QR группы от текущего участника:** QR содержит `group_id` + `group_key` + свободный `sender_id`, выданный allocator'ом. Allocator (создатель) ведёт пул выданных sender_id и не выдаёт дубликаты; QR переподписывается при выдаче нового sender_id. Практика A': поздний участник получает QR напрямую от создателя (allocator).
-- **(б) Key rotation:** создатель генерирует новый `group_key`, рассылка его всем текущим участникам; новичок получает уже новый ключ. Сообщения, зашифрованные старым ключом, для новичка нечитаемы (история до ротации не передаётся).
+1. Создатель генерирует `group_id`, `group_key`, показывает QR-код.
+2. Участники сканируют QR → получают `group_id` + `group_key`.
+3. Сообщение шифруется на `group_key` (AES-256-GCM).
+4. При встрече участников — sync: merge сообщений по Lamport clock, дедупликация по `MessageID`.
 
 ### 4.2. ChatMessage
 
 ```rust
 pub struct ChatMessage {
-    pub id: MessageID,               // ULID (содержит wall-clock — см. оговорку §4.3)
-    pub sender: PubKey,
-    pub sender_id: u32,              // 4 байта, выдан при присоединении (§4.1)
-    pub content: Vec<u8>,            // AES-256-GCM encrypted (group_key)
+    pub id: MessageID,               // ULID
+    pub sender: PubKey,              // Ed25519 pubkey
+    pub content: Vec<u8>,            // AES-256-GCM encrypted
     pub timestamp: LamportClock,     // logical clock (не wall-clock!)
-    pub nonce: [u8; 12],             // = sender_id(4) ‖ counter(8) — §4.1
+    pub nonce: [u8; 12],             // GCM nonce
 }
 ```
 
 **Sync-протокол:**
+
 1. Узел A отправляет узлу B свой `max_lamport_clock`.
-2. B отправляет все сообщения с `clock > max_lamport_clock(A)`.
+2. B отправляет все сообщения с clock > `max_lamport_clock(A)`.
 3. A merge'ит, обновляет `max_lamport_clock`.
-4. Дедупликация по `MessageID` и `(sender_id, counter)`.
+4. Дедупликация по `MessageID`.
 
 ### 4.3. Граница
 
 - Нет Fruiting Gateway — группа живёт только пока участники в радиусе.
 - Нет истории после расформирования — каждый участник хранит локально.
 - Нет Onion, cover traffic, padding — всё в plaintext метаданных (sender, timestamp).
-- **Это нормально для A'** — приватность добавляется на этапе C.
-- **Оговорка про ULID:** MessageID на ULID **содержит wall-clock**; для A' допустимо (сортировка + уникальность), в проде — Lamport/Vector clock (MUSH-ARCH §2.6). ULID в A' не используется как источник логического времени — ordering только по Lamport clock.
+- Это нормально для A' — приватность добавляется на этапе C.
 
 ---
 
@@ -167,71 +207,82 @@ pub struct ChatMessage {
 
 ```
 Телефон A (Group Owner):
-  Поднимает WiFi AP "MUSH-XXXX" (XXXX = last 4 hex of pubkey)
-  IP: 192.168.43.1, порт 7777
+  Поднимает WiFi AP "Mush-XXXX"
+    где XXXX = group_id[0..4] в hex (НЕ pubkey — иначе коллизия при двух группах)
+  Свой IP определяет сам при подключении клиента (может быть 192.168.43.1,
+    192.168.1.1, 192.168.232.1 — зависит от вендора)
+  IP + порт зашиваются в QR при создании группы
+
+QR при создании группы:
+  { group_id, group_key, owner_ip, owner_port, owner_pubkey }
 
 Телефон B (Client):
-  Сканирует SSID "MUSH-*"
+  Сканирует SSID "Mush-*"
   Коннектится, получает IP через DHCP
-  Отправляет bundle на 192.168.43.1:7777
+  Из QR берёт owner_ip:owner_port
+  Отправляет bundle на owner_ip:owner_port
 ```
 
 **Почему hotspot, а не WiFi-Direct:**
+
 - WiFi-Direct P2P Group Owner negotiation — боль на Android (разное поведение на разных вендорах).
 - Hotspot работает на всех Android с API 26+ без root.
 - Для сценария «одна комната» это доказывает весь UX с нулевым риском транспорта.
 
-**⚠️ Вендор-зависимость программного hotspot'а:**
-- Программное создание AP вендор-зависимо: на Android 10+ `LocalOnlyHotspot` выдаёт **рандомный SSID** — задать `MUSH-XXXX` нельзя; для кастомного SSID нужен полноценный hotspot API, который на части прошивок требует `WRITE_SETTINGS` или системных привилегий.
-- На некоторых прошивках (MIUI, EMUI и др.) программный hotspot дополнительно ограничен или требует разрешений вендор-специфичным способом.
-- **Fallback BLE обязателен в критериях приёмки:** критерий 1 (обмен сообщениями) считается пройденным, если работает хотя бы один из транспортов (hotspot ИЛИ BLE), приоритет — hotspot.
+**Owner IP — не хардкодить.** На Samsung — 192.168.43.1, на Xiaomi — 192.168.1.1, на Huawei — 192.168.232.1. Owner при создании группы определяет свой IP (через NetworkInterface API), зашивает его в QR. Клиент читает IP из QR, не угадывает.
 
-**Протокол:** TCP socket, простой бинарный протокол:
+**Протокол:** TCP socket, простой binary framing:
+
 ```
-[4 bytes: длина payload][payload: CBOR-encoded Bundle]
+[4 bytes: length][1 byte: type][payload: CBOR]
 ```
 
-### 5.2. BLE (опционально, если hotspot не работает)
+**Типы bundle в A':**
 
-- Peripheral: рекламирует сервис `UUID = mush-advert`
-- Central: сканирует, коннектится, читает/пишет характеристику
-- Размер MTU: 512 байт (bundle fragment'ация если больше)
+- `0x01` — text message
+- `0x02` — group sync (Lamport clock + deltas)
+- `0x03` — contact handshake
+- `0x04` — decoy hit notification (debug)
+
+### 5.2. BLE — НЕ в A'
+
+BLE вырезан из A'. Причины:
+
+- Android 12+ требует runtime permissions `BLUETOOTH_SCAN` + `BLUETOOTH_CONNECT` + location.
+- GATT MTU negotiation — не везде 512 байт.
+- Fragment'ация bundle'ов по MTU — отдельный код.
+- Для 3-дневного прототипа, где hotspot работает — это мёртвый груз.
+
+BLE вернётся на этапе C, когда hotspot-демо уже доказан.
 
 ---
 
 ## 6. Сенсоры (A')
 
-### 6.1. ContactRateSensor (S1) — базовый
+### 6.1. ContactRateSensor (S1) — threshold-based
 
-> Сенсоры S1–S7 — прикладной уровень MUSH (спам в мессенджере), см. ATTACK-MODEL §18. 11 сетевых сенсоров (сетевой уровень Mycerus) — ATTACK-MODEL §7; в A' их нет (демо без грибницы).
+В A' это честно threshold-based, не CUSUM. CUSUM требует накопления и окна — откладывается до этапа E.
 
 ```rust
 pub struct ContactRateSensor {
-    message_counts: HashMap<PubKey, VecDeque<usize>>,  // msg/контакт за контакт
-    window: usize,               // 10 наблюдений
-    min_observations: usize,     // 10 — алерт только при заполненном окне
-    baseline: HashMap<PubKey, f64>, // медиана
+    message_counts: HashMap<PubKey, VecDeque<usize>>,  // msg/контакт
+    window: usize,                                      // 10 контактов
+    baseline: HashMap<PubKey, f64>,                     // медиана
 }
 
 impl ContactRateSensor {
-    /// msg_count = число сообщений, полученных от пира `from` за текущий
-    /// контакт (синхронизационную сессию)
     pub fn on_message(&mut self, from: PubKey, msg_count: usize) -> Option<Alert> {
         let counts = self.message_counts.entry(from).or_default();
         counts.push_back(msg_count);
         if counts.len() > self.window {
             counts.pop_front();
         }
-
+        
         let median = counts.iter().cloned().collect::<Vec<_>>().median();
         self.baseline.insert(from, median);
-
-        // Демо-упрощение: алерт только при заполненном окне (≥10 наблюдений)
-        if counts.len() < self.min_observations {
-            return None; // baseline ещё неустойчив, без алерта
-        }
-
-        if msg_count > median * 5.0 {  // мгновенный порог — см. предупреждение ниже
+        
+        // Threshold-based для A'. CUSUM — этап E.
+        if msg_count > median * 5.0 {
             Some(Alert::HighRate { from, msg_count, median })
         } else {
             None
@@ -240,15 +291,16 @@ impl ContactRateSensor {
 }
 ```
 
-**Демо-упрощение (нарушение B5 сознательно):** мгновенный порог `5×median` — **сознательное нарушение B5 (threshold gaming)**: атакующий, знающий порог, может держать интенсивность чуть ниже него. В проде — **CUSUM-накопление** (ATTACK-MODEL §18): реагирование на накопленное отклонение, а не на мгновенный срез. Для A' (ручной тест, критерий 5) пороговый срез допустим.
+**Почему threshold, а не CUSUM:**
 
-**Определения и поведение:**
-- `msg_count` — число сообщений, полученных от данного пира за текущий контакт (синхронизационную сессию), а не суммарно за всю историю.
-- Baseline-окно — 10 последних наблюдений (медиана пересчитывается на каждом контакте).
-- При незаполненном окне (< 10 наблюдений) алерт **не генерируется** — baseline по малой выборке неустойчив и давал бы ложные срабатывания.
+- CUSUM требует `baseline_rate` + `k` + `h` + накопление `cusum_pos/neg`.
+- В A' нет FSM, нет долгого состояния — CUSUM бессмыслен.
+- Threshold-based проверяет гипотезу («детектирует ли сенсор спам вообще»), а не production-поведение.
+- Переход на CUSUM — этап E, без изменения API (поле `evidence_tier` уже заложено).
 
 **Что делает при alert:**
-- Логирует в UI: "Контакт X отправил много сообщений".
+
+- Логирует в UI: «Контакт X отправил много сообщений».
 - Не блокирует, не скрывает — только уведомление.
 - Пользователь решает: заблокировать, проигнорировать, или посмотреть.
 
@@ -256,7 +308,9 @@ impl ContactRateSensor {
 
 ```rust
 pub struct DecoyEidSensor {
-    decoy_eids: Vec<EID>,
+    decoy_eids: Vec<EID>,              // генерируются локально
+    rotation_period: usize,            // ротация каждые N контактов
+    contact_count: usize,
 }
 
 impl DecoyEidSensor {
@@ -273,17 +327,61 @@ impl DecoyEidSensor {
 }
 ```
 
-**Семантика decoy-hit (важно):** bundle на decoy EID доказывает, что `source` отправил сообщение на адрес, который владелец этого EID **никому не выдавал**. Но:
+**Как decoy попадают в сеть:**
 
-- **Легитимный ретранслятор не является нарушителем.** Relay-узел, записавший чужой decoy EID из чужого beacon'а (decoy'и публикуются в beacon'ах как приманка) и отправивший на него bundle по своей таблице маршрутизации, не совершает вредоносного действия — он не знает, что EID фейковый.
-- Поэтому сильное evidence должно включать **beacon-handshake binding**: подтверждение, что источник **ранее получил этот decoy от жертвы** (сам вступал с ней в контакт и записал decoy как «легитимный» EID) — то есть отправка на decoy осознанная, а не транзитная.
-
-**Ограничение A' (явное):** полное beacon-handshake binding в A' **не формализовано** — демо без полноценной грибницы и beacon-протокола Mycerus. В A' sensor фиксирует только факт decoy-hit и source; квалификация «источник получал decoy от жертвы / источник — транзитный relay» откладывается на immune-этапы Mycerus (этапы 19–22) и IMMUNE-SPEC-v0.1. В критерии приёмки 6 (ручной тест) источник и жертва находятся в одной комнате — транзитного relay в сценарии нет, ограничение не влияет на демо.
+- Decoy EIDs генерируются локально: `decoy = hash(random_nonce || node_pubkey || epoch)`.
+- Публикуются в SSID/hotspot name как дополнительная строка (debug-режим).
+- В debug-меню — кнопка «отправить на decoy» (для проверки критерия #6).
+- В реальной сети decoy попадут через beacon'ы — но beacon'ов в A' нет.
 
 **Что делает при alert:**
-- Немедленное уведомление: "Обнаружена подозрительная активность от X".
+
+- Немедленное уведомление: «Обнаружена подозрительная активность от X».
 - Пользователь решает: заблокировать или проигнорировать.
 - Логируется для обучения (если Vironet подключён позже).
+
+### 6.3. Backpressure на входящих (не shadow inbox)
+
+Shadow inbox вырезан из A'. Он подразумевает FSM (silent state), которого в A' нет. Без FSM «теневой inbox» — это либо бессмысленный буфер, либо первая версия silent mode. Оба варианта не проверяют гипотезу.
+
+**Что вместо:** обычный backpressure на входящем буфере.
+
+```rust
+pub struct InboxBuffer {
+    max_messages: usize,      // 100
+    max_age: Duration,        // 7 дней
+    messages: VecDeque<IncomingMessage>,
+}
+
+impl InboxBuffer {
+    pub fn push(&mut self, msg: IncomingMessage) {
+        // Eviction: oldest-first по age
+        self.evict_old();
+        
+        // Eviction: oldest-first по количеству
+        if self.messages.len() >= self.max_messages {
+            self.messages.pop_front();
+        }
+        
+        self.messages.push_back(msg);
+    }
+    
+    fn evict_old(&mut self) {
+        let cutoff = now() - self.max_age;
+        while self.messages.front().map(|m| m.timestamp < cutoff).unwrap_or(false) {
+            self.messages.pop_front();
+        }
+    }
+}
+```
+
+**Отличие от shadow inbox:**
+
+- Backpressure — это ограничение ресурсов, не политика безопасности.
+- Сообщения показываются пользователю (нет скрытия).
+- Нет триггера от сенсоров.
+- Нет ручного «восстановления» — старые просто удаляются.
+- Это честно для A'. Silent mode и FSM — этап E.
 
 ---
 
@@ -293,84 +391,173 @@ impl DecoyEidSensor {
 
 | Экран | Что показывает |
 |-------|---------------|
-| **Splash** | Логотип MUSH, генерация ключа (2 сек) |
-| **Onboarding** | Имя, аватар (идентикон), кнопка "Показать QR" |
-| **Chats** | Список групп. Кнопка "+" → создать группу / присоединиться по QR |
+| **Splash** | Логотип Mush, генерация ключа (2 сек) |
+| **Onboarding** | Имя, аватар (идентикон), кнопка «Показать QR» |
+| **Chats** | Список групп. Кнопка «+» → создать группу / присоединиться по QR |
 | **Chat** | Сообщения (входящие/исходящие). Статус: ✓ = отправлено, ✓✓ = получено sync |
-| **Contacts** | Список контактов. Кнопка "Поделиться контактом" (invite-link / QR) |
+| **Contacts** | Список контактов. Кнопка «Поделиться контактом» (invite-link / QR) |
 | **Alerts** | Уведомления от сенсоров (S1, S7). Можно проигнорировать или заблокировать |
+| **Debug (скрытый)** | Кнопка «Отправить на decoy» (для теста критерия #6) |
 
 ### 7.2. Invite-link
 
 ```
-https://mush.app/i#pubkey=abc123&nonce=xyz789
+https://mush.app/i#pubkey=<base64>&nonce=<base64>
 ```
 
-При клике:
-1. Если приложение установлено — открывается, автоматически подхватывает pubkey + nonce.
-2. Если нет — открывается страница со ссылками на APK / TestFlight / F-Droid.
-3. После установки — приложение читает intent / deep link, подхватывает invite.
+**При клике:**
+
+- Если приложение установлено — открывается, автоматически подхватывает pubkey + nonce.
+- Если нет — открывается страница со ссылками на APK / TestFlight / F-Droid.
+- После установки — приложение читает intent / deep link, подхватывает invite.
 
 ---
 
 ## 8. Критерии приёмки A'
 
 | # | Критерий | Как проверить |
-|---|----------|---------------|
-| 1 | Два телефона в одной комнате обмениваются сообщениями | Демо: 2 Android, hotspot **или** BLE (fallback обязателен, §5.1), текст |
+|---|----------|--------------|
+| 1 | Два телефона в одной комнате обмениваются сообщениями | Демо: 2 Android, hotspot, текст |
 | 2 | QR-контакт работает без интернета | Демо: airplane mode, QR scan, handshake |
 | 3 | Invite-link работает с автоподхватом | Демо: клик ссылки → установка → контакт добавлен |
 | 4 | Групповой чат 4 человека синхронизируется | Демо: 4 телефона, сообщения видны всем после sync |
-| 5 | Сенсор S1 детектирует спам (ручной тест) | Демо: 50 сообщений за 10 контактов → alert в UI |
-| 6 | DecoyEidSensor детектирует подделку (ручной тест) | Демо: отправка на decoy EID → alert |
-| 7 | Shadow inbox не переполняется | Проверка: 100+ сообщений → oldest удаляются |
+| 5 | S1 детектирует аномалию (ручной тест) | 50 сообщений подряд от одного контакта → alert в UI |
+| 6 | S7 детектирует decoy hit (debug-кнопка) | Debug: «отправить на decoy» → alert |
+| 7 | Backpressure работает | Проверка: 100+ сообщений → oldest удаляются |
 | 8 | Нет крашей при 30 мин использования | Monkey test: случайные тапы 30 мин |
-| 9 | Нет повторов nonce на group_key | Проверка: 2 отправителя × 100 сообщений, дедуп по (sender_id, counter) не отбрасывает легитимные; fuzz повторного counter — отбрасывается |
+
+**Критерий #5** — переформулирован. В v0.1.0 было «50 сообщений за 10 контактов → alert», но на 2 телефонах это один контакт, не 10. Медиана по окну 10 не работает на 1 значении. Новый критерий: «50 сообщений подряд от одного контакта» — проверяет то же самое, но реально тестируется на 2 телефонах.
 
 ---
 
-## 9. Что НЕ входит в A' (и почему)
+## 9. Что НЕ входит, но заложено как extension point
+
+### 9.1. MessageSource trait
+
+```rust
+pub trait MessageSource {
+    fn send_message(&mut self, msg: &ChatMessage) -> Result<MsgId>;
+    fn receive_messages(&mut self) -> Vec<ChatMessage>;
+    fn status(&self) -> ConnectionStatus;
+}
+
+// A': одна реализация — HotspotMessageSource
+// Этап C+: добавляем BleMessageSource, DtnMessageSource
+```
+
+### 9.2. SensorEvent с evidence_tier
+
+```rust
+pub struct SensorEvent {
+    pub sensor_name: String,
+    pub target: PubKey,
+    pub score: f64,
+    pub evidence_tier: EvidenceTier,  // заложен, но A' использует только Hard
+}
+
+pub enum EvidenceTier {
+    Hard,         // verifiable, объективный факт (decoy hit, rate spike)
+    Soft,         // behavioral, требует CUSUM (добавится на этапе E)
+    Reputational, // complaint, голосование (добавится на этапе D)
+}
+```
+
+**A':** `evidence_tier` поле существует в структуре, но сенсоры всегда возвращают `Hard`. Это позволяет добавить `Soft`/`Reputational` позже без изменения API.
+
+### 9.3. Инварианты (записать сейчас)
+
+```rust
+/// Invariants — hardcoded в ядро, не в геном, не мутируют эволюцией
+pub mod invariants {
+    pub const QUORUM_THRESHOLD_MIN: u32 = 2;           // quorum ≥ 2
+    pub const QUARANTINE_MAX_SCOPE: f64 = 0.1;         // ≤ 10% сети в quarantine
+    pub const SENSOR_PENALTY_TTL_MIN: u64 = 3600;      // минимум 1 час
+    pub const SENSOR_EPSILON_MIN: f64 = 0.5;           // DP privacy budget
+}
+```
+
+**A':** кворум и quarantine не используются (нет FSM), но константы определены. При переходе к этапу E — включаются без изменения кода.
+
+### 9.4. Что НЕ входит в A' (и почему)
 
 | Компонент | Почему не в A' | Когда |
 |-----------|---------------|-------|
 | **Double Ratchet** | Сложнее symmetric, не критично для демо | Этап A |
 | **Onion + cover traffic** | Нет mesh → нет multi-hop | Этап C |
 | **Fruiting Gateway** | Нет persistent групп в A' | Этап D |
-| **Immune plane (тип 202)** | Нет FSM, quarantine, appeals | Этап E / этапы 19–22 Mycerus |
-| **Vironet** | Нет эволюции в однокомнатном демо | Этап E / этап 22 |
+| **Immune plane (тип 202)** | Нет FSM, quarantine, appeals | Этап E |
+| **Vironet** | Нет эволюции в однокомнатном демо | Этап E |
 | **MAC rotation** | Hotspot AP не требует rotation | Этап C |
 | **Partition reconciliation** | Нет partition в одной комнате | Этап E |
 | **Pre-keys** | Нет offline delivery в A' | Этап A |
-| **CUSUM (S1)** | Демо-упрощение порогового среза (нарушение B5 — осознанное) | ATTACK-MODEL §18, продуктовые этапы |
-| **SRE receipt / ReportE2EDelivery** | Нет узловой грибницы и подписанных квитанций (см. §11) | Этапы A/B |
+| **BLE** | Android 12+ permissions + GATT MTU | Этап C |
+| **Shadow inbox** | Бессмыслен без FSM | Этап E |
+| **BPv7** | Избыточен для 2-телефонного демо | Этап A |
 
 ---
 
-## 10. Следующий шаг после A'
+## 10. Прототип: Rust CLI → Kotlin Android
 
-Если A' проходит критерии:
-1. **Этап A:** Double Ratchet, pre-keys, persistent 1-on-1 чаты.
-2. **Этап B:** SQLCipher, Vault, Identicon, Safety Number.
-3. **Этап C:** Onion, cover traffic, BLE transport, MAC rotation.
-4. **Этап D:** Fruiting Gateway, Group CRDT, SBP.
-5. **Этап E:** Immune plane (тип 202), Vironet, stress-test.
+**Решение:** Сначала Rust CLI для проверки логики ядра. Затем Kotlin Android Studio для реального A'.
 
-Если A' **не проходит** (люди не сканируют QR, UX непонятен, sync не работает) — переделываем onboarding и transport, не добавляя сложности.
+**Почему Rust CLI сначала:**
+
+| Риск | Android сразу | Rust CLI сначала |
+|------|--------------|------------------|
+| **Android toolchain** | Studio, SDK, эмулятор — час настройки | `cargo run` — 10 сек |
+| **Отладка handshake** | Логи через Logcat, устройство/эмулятор | `println!` в терминале |
+| **CRDT sync** | Сложно на двух эмуляторах | Два терминала на одной машине |
+| **Sensors** | Нет данных для теста | Симуляция: 50 сообщений → alert |
+| **CI** | Нет | GitHub Actions: `cargo test` |
+
+**Что входит в Rust CLI:**
+
+| Компонент | CLI-версия | Аналог Android |
+|-----------|-----------|----------------|
+| **Transport** | TCP socket (порт 7878) | Hotspot AP |
+| **Contact exchange** | `mush://<base64_pubkey>` в stdout | QR-код |
+| **UI** | TUI (`ratatui`) или stdin/stdout | Jetpack Compose |
+| **Crypto** | `ed25519-dalek`, `x25519-dalek`, `aes-gcm` | Те же библиотеки через JNI |
+| **Bundle framing** | `[length][type][CBOR payload]` | Идентично |
+| **CRDT sync** | TCP merge | WiFi sync |
+| **Sensors** | `ContactRateSensor`, `DecoyEidSensor` | Идентично |
+| **Backpressure** | `InboxBuffer` | Идентично |
+
+**Что НЕ входит в Rust CLI (только Android):**
+
+- WiFi AP / Hotspot API (заменён на TCP)
+- QR-код сканирование (заменён на `mush://` строка)
+- Android permissions, intents, deep links
+- Идентикон, Safety Number, Identicon
+- Jetpack Compose UI
+
+**Roadmap:**
+
+```
+Сейчас:
+  Rust CLI — проверка handshake, CRDT, sensors, framing
+  cargo test — unit tests для crypto, CRDT merge, sensor logic
+  cargo run --bin mush-node — две ноды на одной машине
+
+После проверки (критерии #1–#7 проходят в CLI):
+  Kotlin Android Studio — тот же protocol, нативный UI
+  Hotspot API — вместо TCP
+  QR-камера — вместо stdout
+  APK → два телефона → демо
+```
+
+**Контракт:** Rust CLI и Kotlin Android делят одну логику — protocol не меняется. Только transport layer (TCP ↔ Hotspot) и UI (TUI ↔ Compose).
 
 ---
 
-## 11. Маппинг терминов (чтобы не путать уровни)
+## 11. Следующий шаг после A'
 
-| Термин | Уровень | Нормативный источник | В A' |
-|--------|---------|---------------------|------|
-| **SNS-handshake** | Сетевой (узлы Mycerus) | ТЗ §9 (challenge-response узлов по Ed25519); ATTACK-MODEL | **Не используется** — демо без узловой грибницы |
-| **SBP-handshake** | Прикладной (люди) | MUSH-ARCH §2.2 | Используется (§3, упрощённый) |
-| **Сенсоры S1–S7** | Прикладной (спам в мессенджере) | ATTACK-MODEL §18 | S1 (ContactRate) и S7 (DecoyEid); S2–S6 — продуктовые этапы |
-| **11 сетевых сенсоров** (SNSAnomaly, BeaconConsistency, GradientVelocity, E2ETracking, ResourcePressure, HandshakeRate, ContactQuality, QuorumConsistency, TimeConsistency, FitnessPlausibility, PoolDiversity) | Сетевой (узлы) | ATTACK-MODEL §7; ТЗ этапы 19–19A | **Не используются** — демо без грибницы |
-| **SRE receipt (тип 201)** | Сетевой | MEB-SPEC v0.1.2 §9 | **Не используется** — подтверждение ответственности relay-узла; в демо hotspot'а relay-узлов Mycerus нет |
-| **ReportE2EDelivery** | Сетевой | MGR-API-SPEC §4.12; подпись реализована этапом 18 | **Не используется** — в A' ✓✓ означает «получено при CRDT-sync», без подписанной квитанции; подписанная квитанция — продуктовые этапы |
-| **Immune Block (тип 202)** | Сетевой | ATTACK-MODEL §6 | **Не используется** — каркас реализован (этап 18), но демо A' без immune plane |
+**Если A' проходит критерии:**
 
----
+- **Этап A:** Double Ratchet, pre-keys, persistent 1-on-1 чаты, BPv7 interop.
+- **Этап B:** SQLCipher, Vault, Identicon, Safety Number.
+- **Этап C:** Onion, cover traffic, BLE transport, MAC rotation.
+- **Этап D:** Fruiting Gateway, Group CRDT, SBP.
+- **Этап E:** Immune plane (тип 202), Vironet, CUSUM, silent mode, stress-test.
 
-*MUSH-A'-SPEC — минимальный прототип. Не продукт. Проверка гипотезы. Параллельный трек вне скоупа MVP (ТЗ §3.2).*
+**Если A' не проходит** (люди не сканируют QR, UX непонятен, sync не работает) — переделываем onboarding и transport, не добавляя сложности.
