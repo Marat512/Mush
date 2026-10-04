@@ -1,0 +1,19 @@
+[package]
+name = "mush-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+rand = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+ulid = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
