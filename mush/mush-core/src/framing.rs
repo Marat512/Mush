@@ -72,6 +72,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Option
     Ok(Some(Frame::new(msg_type, payload)))
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,3 +155,9 @@ mod tests {
         assert!(read_frame(&mut b).await.is_err());
     }
 }
+
+// Этап A (ratchet-режим): 0x05 — FullManifest (DTN broadcast), 0x06 —
+// X3dhInit (первый фрейм), 0x07 — RatchetFrame (сообщение сессии).
+pub const TYPE_MANIFEST: u8 = 0x05;
+pub const TYPE_X3DH_INIT: u8 = 0x06;
+pub const TYPE_RATCHET: u8 = 0x07;

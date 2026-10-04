@@ -106,6 +106,31 @@ pub struct PreKeyBundle {
     pub opk: Option<[u8; 32]>,
 }
 
+/// Лимит одиночного bundle, кодируемого в invite-поле `pk=`: base64-строка
+/// ≤ 512 символов — QR больше не переваривает (MUSH-A-SPEC §4.1).
+pub const SMALL_MANIFEST_MAX_CHARS: usize = 512;
+
+impl PreKeyBundle {
+    /// Кодирование для invite-поля `pk=`: CBOR + base64. None, если
+    /// результат не влезает в SMALL_MANIFEST_MAX_CHARS (значит форма
+    /// бандла изменилась — надо чинить лимит, а не плодить silent-обрезку).
+    pub fn to_invite_field(&self) -> Option<String> {
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(self, &mut cbor).ok()?;
+        let encoded = crate::base64::encode(&cbor);
+        if encoded.len() > SMALL_MANIFEST_MAX_CHARS {
+            return None;
+        }
+        Some(encoded)
+    }
+
+    /// Декодирование из invite-поля `pk=` (CBOR + base64).
+    pub fn from_invite_field(s: &str) -> Option<Self> {
+        let bytes = crate::base64::decode(s.trim())?;
+        ciborium::de::from_reader(bytes.as_slice()).ok()
+    }
+}
+
 /// Хранилище pre-keys стороны, принимающей соединения (Bob).
 /// Узел генерирует N одноразовых ключей и пополняет очередь по мере траты.
 pub struct PreKeyStore {
@@ -205,8 +230,9 @@ impl PreKeyStore {
             None => F_PADDING,
         };
         let sk = derive_sk(&ad, &[dh1, dh2, dh3, dh4]);
+        let session_id = derive_session_id(&sk, &ad);
         let first = aes_gcm_decrypt_aad(&sk, &init.ciphertext, &init.nonce, &ad)?;
-        Some((SessionStart { sk, ad }, first))
+        Some((SessionStart { sk, ad, session_id }, first))
     }
 
     pub fn identity_pubkey(&self) -> [u8; 32] {
@@ -221,6 +247,11 @@ impl PreKeyStore {
     /// (DH(SPK, DHS_A) на первом сообщении).
     pub fn signed_pre_key_secret(&self) -> &StaticSecret {
         &self.spk.secret
+    }
+
+    /// Сколько одноразовых ключей ждут публикации.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     /// TTL-prune tombstone used_pre_keys.
@@ -386,12 +417,16 @@ pub struct X3dhInit {
     pub nonce: [u8; 12],
 }
 
-/// Результат X3DH: общий секрет и associated data обеих сторон.
-/// Поверх этого строится Double Ratchet.
+/// Результат X3DH: общий секрет, associated data и идентификатор сессии.
+/// Поверх этого строится Double Ratchet. session_id = HKDF(SK, ..., AD)
+/// — обе стороны выводят его независимо; едет в заголовке каждого
+/// ratchet-сообщения: без него потеря первого сообщения рождает
+/// «полусессии» и неразличимые ошибки на приёмнике.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
     pub sk: [u8; 32],
     pub ad: [u8; 64],
+    pub session_id: [u8; 16],
 }
 
 pub fn associated_data(ik_a: &[u8; 32], ik_b: &[u8; 32]) -> [u8; 64] {
@@ -414,6 +449,12 @@ fn derive_sk(ad: &[u8; 64], dhs: &[[u8; 32]; 4]) -> [u8; 32] {
         ikm.extend_from_slice(dh);
     }
     hkdf_derive(&ikm, b"mush-x3dh-sk", ad)
+}
+
+/// Идентификатор сессии: обе стороны выводят одинаковый из SK и AD.
+fn derive_session_id(sk: &[u8; 32], ad: &[u8; 64]) -> [u8; 16] {
+    let full = hkdf_derive(sk, b"mush-session-id", ad);
+    full[..16].try_into().expect("16 of 32")
 }
 
 /// Сторона initiator (Alice): по бандлу Bob и identity Alice стартует сессию.
@@ -459,7 +500,11 @@ impl X3dhInitiator {
         OsRng.fill_bytes(&mut nonce);
         let ciphertext = aes_gcm_encrypt_aad(&sk, first_message, &nonce, &ad);
         (
-            SessionStart { sk, ad },
+            SessionStart {
+                sk,
+                ad,
+                session_id: derive_session_id(&sk, &ad),
+            },
             X3dhInit {
                 identity: my_identity,
                 eph: eph_public,
@@ -480,6 +525,10 @@ impl X3dhInitiator {
 /// Заголовок ratchet-сообщения (открытая часть).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RatchetHeader {
+    /// Идентификатор сессии (обе стороны выводят из SK) — защита от
+    /// «полусессий» при потере первого сообщения: чужой id отклоняется
+    /// до любых операций с цепочками.
+    pub session_id: [u8; 16],
     /// Текущий DH-ratchet публичный ключ отправителя.
     pub ratchet_key: [u8; 32],
     /// Индекс msg key этого сообщения в его цепочке (n).
@@ -564,6 +613,8 @@ pub struct RatchetSession {
     /// TTL — SKIPPED_TTL_MS, prune при export и lazily при decrypt (MUSH-A-SPEC §3).
     skipped: std::collections::BTreeMap<([u8; 32], u32), ([u8; 32], u64)>,
     ad: [u8; 64],
+    /// Идентификатор сессии — проверяется в каждом входящем заголовке.
+    session_id: [u8; 16],
     /// Responder-only: собственный SPK-секрет до обработки первого
     /// сообщения (recv-цепочка строится из DH(SPK, DHS_A)).
     spk_secret: Option<StaticSecret>,
@@ -597,6 +648,7 @@ impl RatchetSession {
             prev_send_len: 0,
             skipped: std::collections::BTreeMap::new(),
             ad: start.ad,
+            session_id: start.session_id,
             spk_secret: None,
             seen_ratchet_keys: std::collections::HashMap::new(),
             logical_clock: 0,
@@ -617,6 +669,7 @@ impl RatchetSession {
             prev_send_len: 0,
             skipped: std::collections::BTreeMap::new(),
             ad: start.ad,
+            session_id: start.session_id,
             spk_secret: Some(spk_secret),
             seen_ratchet_keys: std::collections::HashMap::new(),
             logical_clock: 0,
@@ -636,6 +689,7 @@ impl RatchetSession {
         let ciphertext = aes_gcm_encrypt_aad(&mk, plaintext, &nonce, &self.ad);
         Some(RatchetMessage {
             header: RatchetHeader {
+                session_id: self.session_id,
                 ratchet_key,
                 chain_index: used_index,
                 prev_chain_len: self.prev_send_len,
@@ -649,6 +703,11 @@ impl RatchetSession {
     /// None при невалидном ключе, израсходованном индексе (replay) или
     /// слишком большом разрыве (DoS-страж).
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Option<Vec<u8>> {
+        // Чужая сессия — отказ до любых операций с цепочками (иначе
+        // потерянное первое сообщение рождает полусессии и мусор в skipped).
+        if msg.header.session_id != self.session_id {
+            return None;
+        }
         self.logical_clock += 1;
         let remote_key = msg.header.ratchet_key;
         let n = msg.header.chain_index;
@@ -810,6 +869,8 @@ pub struct RatchetSessionState {
     pub dhr: Option<[u8; 32]>,
     /// Логический счётчик сессии (события encrypt/decrypt) — осень TTL.
     pub logical_clock: u64,
+    /// Идентификатор сессии (проверяется в каждом входящем заголовке).
+    pub session_id: [u8; 16],
     pub send_chain: Option<([u8; 32], u32)>,
     pub recv_chain: Option<([u8; 32], u32)>,
     pub prev_send_len: u32,
@@ -828,7 +889,7 @@ impl RatchetSession {
     /// `prune_expired()`. Инвариант размера (< 8 KB) — в тестах.
     pub fn export_state(&self) -> RatchetSessionState {
         RatchetSessionState {
-            version: 1,
+            version: 2,
             root_key: self.root_key,
             dhs: self.dhs.to_bytes(),
             dhr: self.dhr,
@@ -836,6 +897,7 @@ impl RatchetSession {
             send_chain: self.send_chain.map(|c| (c.key, c.index)),
             recv_chain: self.recv_chain.map(|c| (c.key, c.index)),
             prev_send_len: self.prev_send_len,
+            session_id: self.session_id,
             skipped: self.skipped.iter().map(|(k, v)| (*k, *v)).collect(),
             seen: self
                 .seen_ratchet_keys
@@ -850,7 +912,7 @@ impl RatchetSession {
     /// Восстановление состояния. `spk_secret` не сериализуется (transient):
     /// к моменту persist сессия уже обменялась сообщениями.
     pub fn import_state(state: &RatchetSessionState) -> Option<Self> {
-        if state.version != 1 {
+        if state.version != 2 {
             return None;
         }
         let mut ad = [0u8; 64];
@@ -867,6 +929,7 @@ impl RatchetSession {
             spk_secret: None,
             seen_ratchet_keys: state.seen.iter().map(|(k, ts)| (*k, *ts)).collect(),
             logical_clock: state.logical_clock,
+            session_id: state.session_id,
             ad,
         })
     }
@@ -1134,7 +1197,7 @@ mod tests {
         let (mut alice, _bob) = dr_pair();
         alice.encrypt(b"x").unwrap();
         let mut state = alice.export_state();
-        state.version = 2;
+        state.version = 99;
         assert!(RatchetSession::import_state(&state).is_none());
     }
 
@@ -1327,5 +1390,118 @@ mod golden {
             unhex("a82c7f766251ee4728da3e4be268116dac3cef0035967d1217d8c799d64643f8")
         );
         assert_eq!(next.index, 1);
+    }
+}
+
+#[cfg(test)]
+mod wire_contract {
+    //! Контракты wire-уровня перед transport-интеграцией: session id,
+    //! small manifest в лимите invite.
+    use super::*;
+
+    #[test]
+    fn session_id_matches_both_sides_and_rejects_foreign() {
+        let (mut alice, mut bob) = {
+            let (mut store, _id) = {
+                let bob_id = Identity::generate();
+                let mut s = PreKeyStore::new(bob_id);
+                s.replenish(3);
+                (s, ())
+            };
+            let alice_id = Identity::generate();
+            let bundle = store.publish_bundle();
+            let spk = bundle.spk;
+            let (start, init) = X3dhInitiator::start(&alice_id, &bundle, b"hi").unwrap();
+            let (bstart, _) = store.complete_handshake(&init).unwrap();
+            (
+                RatchetSession::new_initiator(&start, &spk),
+                RatchetSession::new_responder(&bstart, store.signed_pre_key_secret().clone()),
+            )
+        };
+        let m = alice.encrypt(b"payload").unwrap();
+        // session_id в заголовке = session_id обеих сессий.
+        assert_eq!(m.header.session_id, alice.export_state().session_id);
+        assert_eq!(m.header.session_id, bob.export_state().session_id);
+        assert_eq!(bob.decrypt(&m).unwrap(), b"payload");
+
+        // Чужой session id — отказ до любых операций с цепочками.
+        let mut foreign = alice.encrypt(b"x").unwrap();
+        foreign.header.session_id = [0xEE; 16];
+        assert!(bob.decrypt(&foreign).is_none());
+        // И состояние Bob'а после отказа не тронуто: его же сообщение
+        // продолжает дешифроваться штатно.
+        let ok = alice.encrypt(b"next").unwrap();
+        assert_eq!(bob.decrypt(&ok).unwrap(), b"next");
+    }
+
+    #[test]
+    fn small_manifest_fits_invite_limit() {
+        let mut store = PreKeyStore::new(Identity::generate());
+        store.replenish(2);
+        let bundle = store.publish_bundle();
+        let field = bundle.to_invite_field().expect("bundle кодируется");
+        assert!(
+            field.len() <= SMALL_MANIFEST_MAX_CHARS,
+            "bundle {} chars > {}",
+            field.len(),
+            SMALL_MANIFEST_MAX_CHARS
+        );
+        let decoded = PreKeyBundle::from_invite_field(&field).expect("декодируется");
+        assert_eq!(decoded.identity, bundle.identity);
+        assert_eq!(decoded.spk, bundle.spk);
+        assert_eq!(decoded.opk_id, bundle.opk_id);
+        assert_eq!(decoded.opk, bundle.opk);
+    }
+}
+
+#[cfg(test)]
+mod fs_integration {
+    //! Forward secrecy на уровне сессии: перехват сохранённого состояния
+    //! после N сообщений не раскрывает ранние сообщения (MUSH-A-SPEC §5.4).
+    use super::*;
+
+    #[test]
+    fn compromised_state_cannot_decrypt_old_messages() {
+        let (mut store, _id) = {
+            let bob_id = Identity::generate();
+            let mut s = PreKeyStore::new(bob_id);
+            s.replenish(3);
+            (s, ())
+        };
+        let alice_id = Identity::generate();
+        let bundle = store.publish_bundle();
+        let spk = bundle.spk;
+        let (start, init) = X3dhInitiator::start(&alice_id, &bundle, b"hi").unwrap();
+        let (bstart, _) = store.complete_handshake(&init).unwrap();
+        let mut alice = RatchetSession::new_initiator(&start, &spk);
+        let mut bob = RatchetSession::new_responder(&bstart, store.signed_pre_key_secret().clone());
+
+        // Обмен 10 сообщениями в обе стороны (форсирует ratchet-шаги).
+        let mut captured = Vec::new();
+        for i in 0..10u32 {
+            let m = alice.encrypt(format!("secret-{i}").as_bytes()).unwrap();
+            captured.push(m.clone());
+            assert_eq!(bob.decrypt(&m).unwrap(), format!("secret-{i}").into_bytes());
+            if i % 3 == 2 {
+                let r = bob.encrypt(format!("reply-{i}").as_bytes()).unwrap();
+                alice.decrypt(&r).unwrap();
+            }
+        }
+
+        // Компрометация: злоумышленник получает persisted-состояние Bob'а.
+        let state = bob.export_state();
+        let mut attacker_bob = RatchetSession::import_state(&state).unwrap();
+
+        // Старые ciphertext'ы не открываются: msg keys не хранятся в state
+        // (chain прошла вперёд, skipped пуст — сообщения шли по порядку).
+        for (i, frame) in captured.iter().enumerate() {
+            assert!(
+                attacker_bob.decrypt(frame).is_none(),
+                "старый фрейм {i} открылся из скомпрометированного состояния — FS нарушена"
+            );
+        }
+        // А будущие сообщения легитимного пира по-прежнему работают.
+        let m = alice.encrypt(b"still talking").unwrap();
+        assert_eq!(attacker_bob.decrypt(&m).unwrap(), b"still talking");
     }
 }

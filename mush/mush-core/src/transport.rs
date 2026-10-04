@@ -11,7 +11,10 @@ use tokio::time::timeout;
 
 use crate::base64;
 use crate::crdt::{hex, AdHocGroup, ChatMessage, GroupId, PubKey};
-use crate::framing::{self, Frame, TYPE_DECOY, TYPE_HANDSHAKE, TYPE_SYNC, TYPE_TEXT};
+use crate::crypto::ratchet;
+use crate::framing::{
+    self, Frame, TYPE_DECOY, TYPE_HANDSHAKE, TYPE_RATCHET, TYPE_SYNC, TYPE_TEXT, TYPE_X3DH_INIT,
+};
 use crate::identity::Identity;
 use crate::sensors::{
     now_millis, Alert, ContactRateSensor, DecoyEidSensor, InboxBuffer, IncomingMessage,
@@ -29,6 +32,8 @@ struct Peer {
     #[allow(dead_code)] // established per A'-SPEC §3.1; chat payload uses group_key in A'
     session_key: [u8; 32],
     group_id: GroupId,
+    /// Этап A, ratchet-режим: pairwise Double Ratchet сессия с этим пиром.
+    ratchet: Option<crate::crypto::ratchet::RatchetSession>,
 }
 
 /// Known contact (CLI-SPEC: /contacts).
@@ -39,7 +44,8 @@ pub struct Contact {
 }
 
 /// Invite-link (A'-SPEC §7.2, CLI adaptation): carries pubkey, one-time nonce,
-/// rendezvous address, and the ad-hoc group material that Android puts in QR.
+/// rendezvous address, the ad-hoc group material that Android puts in QR,
+/// и (этап A, ratchet-режим) pre-key bundle в поле `pk=`.
 #[derive(Debug, Clone)]
 pub struct Invite {
     pub pubkey: PubKey,
@@ -47,18 +53,24 @@ pub struct Invite {
     pub addr: String,
     pub group_id: GroupId,
     pub group_key: [u8; 32],
+    /// base64(CBOR(PreKeyBundle)) — small manifest, ≤512 символов.
+    pub pk: Option<String>,
 }
 
 impl Invite {
     pub fn render(&self) -> String {
-        format!(
+        let base = format!(
             "mush://{}&nonce={}&addr={}&group={}-{}",
             base64::encode(&self.pubkey),
             base64::encode(&self.nonce),
             self.addr,
             base64::encode(&self.group_id),
             base64::encode(&self.group_key),
-        )
+        );
+        match &self.pk {
+            Some(pk) => format!("{base}&pk={pk}"),
+            None => base,
+        }
     }
 
     pub fn parse(s: &str) -> Result<Invite, String> {
@@ -79,6 +91,7 @@ impl Invite {
         let mut nonce = None;
         let mut addr = None;
         let mut group = None;
+        let mut pk = None;
         for part in query.split('&') {
             let Some((key, val)) = part.split_once('=') else {
                 continue;
@@ -92,6 +105,7 @@ impl Invite {
                     );
                 }
                 "addr" => addr = Some(val.to_string()),
+                "pk" => pk = Some(val.to_string()),
                 "group" => {
                     let (gid_b64, gkey_b64) = val.split_once('-').ok_or("bad group part")?;
                     let gid = base64::decode(gid_b64).ok_or("bad group id base64")?;
@@ -103,6 +117,8 @@ impl Invite {
                             .map_err(|_| "group key must be 32 bytes")?,
                     ));
                 }
+                // Tolerant parsing: неизвестные поля invite игнорируются
+                // (форвард-совместимость, MUSH-A-SPEC §4.1).
                 _ => {}
             }
         }
@@ -113,6 +129,7 @@ impl Invite {
             addr: addr.ok_or("invite missing addr")?,
             group_id,
             group_key,
+            pk,
         })
     }
 }
@@ -123,6 +140,17 @@ impl Invite {
 pub struct SyncPayload {
     pub max_lamport: Option<u64>,
     pub messages: Option<Vec<ChatMessage>>,
+}
+
+/// Ratchet frame payload (0x07, этап A): открытые CRDT-поля (id, lamport)
+/// плюс pairwise Double Ratchet сообщение. Текст едет внутри ratchet AEAD.
+/// Поля id/lamport открыты — в legacy-режиме они тоже открыты (ChatMessage
+/// курсирует по фрейму), а для CRDT-мержа нужны всем сторонам.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetFrame {
+    pub id: String,
+    pub lamport: u64,
+    pub message: ratchet::RatchetMessage,
 }
 
 /// Core-level node events. Emitted over an optional sink so embedders (the JNI
@@ -176,6 +204,21 @@ pub struct Node {
     /// Optional push-event sink (see `NodeEvent`). Set by embedders; the CLI
     /// and tests leave it unset.
     event_sink: Option<mpsc::UnboundedSender<NodeEvent>>,
+    /// Этап A: протокол рукопожатия/сообщений. Default Legacy — CLI-smoke и
+    /// Android не тронуты; Ratchet включается явно (MUSH-A-SPEC §5).
+    crypto_mode: CryptoMode,
+    /// Этап A: pre-keys (SPK + OPK) для ratchet-режима.
+    pre_key_store: ratchet::PreKeyStore,
+    /// Этап A: tombstone использованных бандлов на стороне initiator'а.
+    bundle_consumer: ratchet::BundleConsumer,
+}
+
+/// Протокол обмена (MUSH-A-SPEC §5): Legacy — SNS handshake + group_key
+/// (A'-SPEC §3.1); Ratchet — X3DH + Double Ratchet pairwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoMode {
+    Legacy,
+    Ratchet,
 }
 
 impl Node {
@@ -183,7 +226,7 @@ impl Node {
         let identity = Identity::generate();
         let me = identity.pubkey_bytes();
         Node {
-            identity,
+            identity: identity.clone(),
             name: name.to_string(),
             configured_port: port,
             bound_addr: None,
@@ -201,6 +244,60 @@ impl Node {
             idle_flush: Duration::from_secs(1),
             self_ref: None,
             event_sink: None,
+            crypto_mode: CryptoMode::Legacy,
+            pre_key_store: ratchet::PreKeyStore::new(identity),
+            bundle_consumer: ratchet::BundleConsumer::new(),
+        }
+    }
+
+    /// Этап A: включить ratchet-режим (до `run`/первого invite). Пополняет
+    /// очередь одноразовых ключей.
+    pub fn set_crypto_mode(&mut self, mode: CryptoMode) {
+        self.crypto_mode = mode;
+        if mode == CryptoMode::Ratchet && self.pre_key_store.pending_count() < 50 {
+            self.pre_key_store.replenish(50);
+        }
+    }
+
+    pub fn crypto_mode(&self) -> CryptoMode {
+        self.crypto_mode
+    }
+
+    /// Этап A: responder-side приём X3dhInit (только ratchet-режим).
+    pub fn accept_ratchet(
+        &mut self,
+        init: &ratchet::X3dhInit,
+    ) -> Option<(ratchet::SessionStart, Vec<u8>)> {
+        if self.crypto_mode != CryptoMode::Ratchet {
+            return None;
+        }
+        self.pre_key_store.complete_handshake(init)
+    }
+
+    /// Этап A: экспорт pairwise-сессии с пиром (persist, &self — идемпотентно).
+    pub fn export_peer_session(&self, peer: &PubKey) -> Option<ratchet::RatchetSessionState> {
+        self.peers
+            .get(peer)?
+            .ratchet
+            .as_ref()
+            .map(|s| s.export_state())
+    }
+
+    /// Этап A: восстановление pairwise-сессии после рестарта.
+    pub fn import_peer_session(
+        &mut self,
+        peer: &PubKey,
+        state: &ratchet::RatchetSessionState,
+    ) -> bool {
+        let Some(session) = ratchet::RatchetSession::import_state(state) else {
+            return false;
+        };
+        match self.peers.get_mut(peer) {
+            Some(p) => {
+                p.ratchet = Some(session);
+                true
+            }
+            None => false,
         }
     }
 
@@ -248,12 +345,23 @@ impl Node {
         });
         let group_id = self.ensure_default_group();
         let group = &self.groups[&group_id];
+        // Ratchet-режим: к invite прикрепляем свежий pre-key bundle (pk=),
+        // сканирующий получает и группу, и бандл одной строкой.
+        let pk = if self.crypto_mode == CryptoMode::Ratchet {
+            if self.pre_key_store.pending_count() < 10 {
+                self.pre_key_store.replenish(50);
+            }
+            self.pre_key_store.publish_bundle().to_invite_field()
+        } else {
+            None
+        };
         Invite {
             pubkey: self.pubkey(),
             nonce,
             addr,
             group_id: group.group_id,
             group_key: group.group_key,
+            pk,
         }
         .render()
     }
@@ -344,6 +452,7 @@ impl Node {
                 decoys,
                 session_key: session.session_key,
                 group_id,
+                ratchet: None,
             },
         );
         self.emit(NodeEvent::HandshakeComplete {
@@ -382,11 +491,99 @@ impl Node {
             .map_err(|_| "connect timed out")?
             .map_err(|e| format!("connect to {} failed: {e}", invite.addr))?;
         let (mut reader, writer) = stream.into_split();
+        let mut writer = writer;
+
+        // Этап A, ratchet-режим: X3DH вместо SNS. Первый фрейм — X3dhInit.
+        if self.crypto_mode == CryptoMode::Ratchet {
+            let pk_field = invite
+                .pk
+                .as_deref()
+                .ok_or("invite missing pk= bundle (ratchet mode)")?;
+            let bundle =
+                ratchet::PreKeyBundle::from_invite_field(pk_field).ok_or("bad pk= bundle")?;
+            if !self.bundle_consumer.mark_used(&bundle) {
+                return Err("bundle OPK already used by this node".to_string());
+            }
+            let (start, init) =
+                ratchet::X3dhInitiator::start(&self.identity, &bundle, self.name.as_bytes())
+                    .ok_or("x3dh initiator failed")?;
+            let frame = Frame::typed(TYPE_X3DH_INIT, &init).map_err(|e| e.to_string())?;
+            framing::write_frame(&mut writer, &frame)
+                .await
+                .map_err(|e| format!("send x3dh init failed: {e}"))?;
+
+            if !self.groups.contains_key(&invite.group_id) {
+                let me = self.pubkey();
+                self.groups.insert(
+                    invite.group_id,
+                    AdHocGroup::join(invite.group_id, invite.group_key, &me),
+                );
+                let dead: Vec<GroupId> = self
+                    .groups
+                    .iter()
+                    .filter(|(id, g)| {
+                        **id != invite.group_id && g.is_empty() && g.members.len() <= 1
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in dead {
+                    self.groups.remove(&id);
+                }
+            }
+            let peer_key = bundle.identity;
+            self.contacts.insert(
+                peer_key,
+                Contact {
+                    name: crate::sensors::short_key(&peer_key),
+                    last_seen: Some(Instant::now()),
+                },
+            );
+            if let Some(group) = self.groups.get_mut(&invite.group_id) {
+                group.add_member(peer_key);
+            }
+            self.peers.insert(
+                peer_key,
+                Peer {
+                    writer,
+                    name: crate::sensors::short_key(&peer_key),
+                    decoys: Vec::new(),
+                    session_key: [0u8; 32],
+                    group_id: invite.group_id,
+                    ratchet: Some(ratchet::RatchetSession::new_initiator(&start, &bundle.spk)),
+                },
+            );
+            let me = self
+                .self_ref
+                .clone()
+                .ok_or("node is not running (no self handle)")?;
+            tokio::spawn(async move {
+                Node::outbound_loop(me, peer_key, reader).await;
+            });
+            // Активация: первое ratchet-сообщение (пустой текст) владельцу —
+            // без него responder-сторона не может шифровать (send-цепочка
+            // строится из DH с ratchet-ключом initiator'а).
+            let activation = {
+                let peer = self.peers.get_mut(&peer_key).expect("peer just inserted");
+                peer.ratchet.as_mut().and_then(|s| s.encrypt(b""))
+            };
+            if let Some(msg) = activation {
+                if let Ok(frame) = Frame::typed(
+                    TYPE_RATCHET,
+                    &RatchetFrame {
+                        id: "activation".to_string(),
+                        lamport: 0,
+                        message: msg,
+                    },
+                ) {
+                    self.send_to(&peer_key, &frame).await;
+                }
+            }
+            return Ok(());
+        }
 
         let initiator = HandshakeInitiator::new(self.identity.clone(), invite.nonce);
         let offer = initiator.start(&self.name, self.s7.active_decoys().to_vec());
         let frame = Frame::typed(TYPE_HANDSHAKE, &offer).map_err(|e| e.to_string())?;
-        let mut writer = writer;
         framing::write_frame(&mut writer, &frame)
             .await
             .map_err(|e| format!("send handshake failed: {e}"))?;
@@ -487,6 +684,83 @@ impl Node {
                 entry.1 = Instant::now();
                 self.relay(conn, frame).await;
             }
+            TYPE_RATCHET => {
+                // Этап A: pairwise ratchet-сообщение. Текст — внутри AEAD,
+                // id/lamport открыты для CRDT-мержа; content группы хранит
+                // plaintext (sender-side история — group_key AES: читаем
+                // оба варианта, см. history_texts).
+                if self.crypto_mode != CryptoMode::Ratchet {
+                    tracing::warn!("ratchet frame in legacy mode — dropped");
+                    return;
+                }
+                let Ok(rf) = frame.decode::<RatchetFrame>() else {
+                    return;
+                };
+                let (text, group_id, sender) = {
+                    let Some(peer) = self.peers.get_mut(conn) else {
+                        return;
+                    };
+                    let Some(session) = peer.ratchet.as_mut() else {
+                        return;
+                    };
+                    let Some(bytes) = session.decrypt(&rf.message) else {
+                        tracing::warn!(
+                            "ratchet decrypt failed from {}",
+                            crate::sensors::short_key(conn)
+                        );
+                        return;
+                    };
+                    (
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                        peer.group_id,
+                        *conn,
+                    )
+                };
+                // Пустой текст — активация сессии (initiator -> responder
+                // сразу после join): активирует send-цепочку responder'а,
+                // не плодя записи в истории.
+                if text.is_empty() {
+                    return;
+                }
+                let msg = ChatMessage {
+                    id: rf.id,
+                    sender,
+                    content: text.clone().into_bytes(),
+                    timestamp: rf.lamport,
+                    nonce: [0u8; 12],
+                };
+                let is_new = match self.groups.get_mut(&group_id) {
+                    Some(group) => group.insert(msg.clone()),
+                    None => false,
+                };
+                if !is_new {
+                    return; // duplicate — stop relay
+                }
+                let group_label = Self::group_label(&group_id);
+                self.emit(NodeEvent::Message {
+                    group: group_id,
+                    sender: msg.sender,
+                    text: text.clone(),
+                    lamport: msg.timestamp,
+                });
+                println!("[{group_label}] {}: {text}", self.contact_name(&msg.sender));
+                // Pairwise-шифрование не ретранслирует сырой фрейм:
+                // релей-узел расшифровал — перешифровывает для каждого
+                // пира СВОЕЙ сессией (те же id/lamport -> CRDT-дедуп).
+                self.relay_ratchet(conn, group_id, &msg.id, msg.timestamp, text.as_str())
+                    .await;
+                self.inbox.push(IncomingMessage {
+                    from: msg.sender,
+                    text,
+                    received_at: std::time::SystemTime::now(),
+                });
+                let entry = self
+                    .pending_bursts
+                    .entry(msg.sender)
+                    .or_insert((0, Instant::now()));
+                entry.0 += 1;
+                entry.1 = Instant::now();
+            }
             TYPE_SYNC => {
                 let Ok(sync) = frame.decode::<SyncPayload>() else {
                     return;
@@ -548,6 +822,42 @@ impl Node {
             if let Err(e) = framing::write_frame(&mut peer.writer, frame).await {
                 tracing::warn!("send to {} failed: {e}", self.contact_name(key));
             }
+        }
+    }
+
+    /// Этап A: ретрансляция ratchet-сообщения — НЕ сырого фрейма, а
+    /// перешифровка текстом для каждого пира группы (pairwise сессии).
+    /// id/lamport сохраняются — CRDT-мерж и дедуп работают как в legacy.
+    async fn relay_ratchet(
+        &mut self,
+        exclude: &PubKey,
+        group_id: GroupId,
+        id: &str,
+        lamport: u64,
+        text: &str,
+    ) {
+        let mut frames: Vec<(PubKey, Frame)> = Vec::new();
+        for (key, peer) in self.peers.iter_mut() {
+            if key == exclude || peer.group_id != group_id {
+                continue;
+            }
+            let Some(session) = peer.ratchet.as_mut() else {
+                continue;
+            };
+            let Some(encrypted) = session.encrypt(text.as_bytes()) else {
+                continue;
+            };
+            let rf = RatchetFrame {
+                id: id.to_string(),
+                lamport,
+                message: encrypted,
+            };
+            if let Ok(frame) = Frame::typed(TYPE_RATCHET, &rf) {
+                frames.push((*key, frame));
+            }
+        }
+        for (key, frame) in frames {
+            self.send_to(&key, &frame).await;
         }
     }
 
@@ -619,8 +929,36 @@ impl Node {
             .get_mut(&group_id)
             .ok_or("group missing")?
             .append_local(&me, text);
-        let frame = Frame::typed(TYPE_TEXT, &msg).map_err(|e| e.to_string())?;
-        self.broadcast(&group_id, &frame).await;
+        if self.crypto_mode == CryptoMode::Ratchet {
+            // Этап A: текст едет внутри pairwise ratchet AEAD; открытые
+            // id/lamport CRDT сохраняют сходимость истории.
+            let mut frames: Vec<(PubKey, Frame)> = Vec::new();
+            for (key, peer) in self.peers.iter_mut() {
+                if peer.group_id != group_id {
+                    continue;
+                }
+                let Some(session) = peer.ratchet.as_mut() else {
+                    continue;
+                };
+                let Some(encrypted) = session.encrypt(text.as_bytes()) else {
+                    continue;
+                };
+                let rf = RatchetFrame {
+                    id: msg.id.clone(),
+                    lamport: msg.timestamp,
+                    message: encrypted,
+                };
+                if let Ok(frame) = Frame::typed(TYPE_RATCHET, &rf) {
+                    frames.push((*key, frame));
+                }
+            }
+            for (key, frame) in frames {
+                self.send_to(&key, &frame).await;
+            }
+        } else {
+            let frame = Frame::typed(TYPE_TEXT, &msg).map_err(|e| e.to_string())?;
+            self.broadcast(&group_id, &frame).await;
+        }
         println!("[{}] {}: {text} ✓", Self::group_label(&group_id), self.name);
         Ok(())
     }
@@ -792,10 +1130,17 @@ impl Node {
             return Vec::new();
         };
         match self.groups.get(&group_id) {
+            // Этап A: в ratchet-режиме у принимающей стороны content — plaintext
+            // (текст шёл внутри ratchet AEAD), у отправителя — group_key AES.
+            // Порядок: сначала AES-дешифровка, fallback — UTF-8 plaintext.
             Some(group) => group
                 .history()
                 .iter()
-                .map(|m| group.decrypt(m).unwrap_or_else(|| "<undecryptable>".into()))
+                .map(|m| {
+                    group
+                        .decrypt(m)
+                        .unwrap_or_else(|| String::from_utf8_lossy(&m.content).into_owned())
+                })
                 .collect(),
             None => Vec::new(),
         }
@@ -818,6 +1163,80 @@ impl Node {
         let Ok(Some(first)) = framing::read_frame(&mut reader).await else {
             return;
         };
+
+        // Этап A, ratchet-режим: первый фрейм — X3dhInit (SNS не используется).
+        if first.msg_type == TYPE_X3DH_INIT {
+            let Ok(init) = first.decode::<ratchet::X3dhInit>() else {
+                return;
+            };
+            let completed = {
+                let mut n = node.lock().await;
+                n.accept_ratchet(&init)
+            };
+            let (start, first_msg) = match completed {
+                Some(v) => v,
+                None => {
+                    tracing::warn!("x3dh init rejected");
+                    return;
+                }
+            };
+            let peer_key = init.identity;
+            let peer_name = String::from_utf8_lossy(&first_msg).into_owned();
+            {
+                let mut n = node.lock().await;
+                let group_id = n.ensure_default_group();
+                n.contacts.insert(
+                    peer_key,
+                    Contact {
+                        name: peer_name.clone(),
+                        last_seen: Some(Instant::now()),
+                    },
+                );
+                if let Some(group) = n.groups.get_mut(&group_id) {
+                    group.add_member(peer_key);
+                }
+                let spk = n.pre_key_store.signed_pre_key_secret().clone();
+                n.peers.insert(
+                    peer_key,
+                    Peer {
+                        writer,
+                        name: peer_name,
+                        decoys: Vec::new(),
+                        session_key: [0u8; 32],
+                        group_id,
+                        ratchet: Some(ratchet::RatchetSession::new_responder(&start, spk)),
+                    },
+                );
+                n.emit(NodeEvent::HandshakeComplete {
+                    peer: peer_key,
+                    name: n
+                        .peers
+                        .get(&peer_key)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default(),
+                });
+            }
+            loop {
+                match framing::read_frame(&mut reader).await {
+                    Ok(Some(frame)) => {
+                        let mut n = node.lock().await;
+                        n.process_frame(&peer_key, &frame).await;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("connection error: {e}");
+                        break;
+                    }
+                }
+            }
+            let mut n = node.lock().await;
+            n.peers.remove(&peer_key);
+            n.contacts
+                .entry(peer_key)
+                .and_modify(|c| c.last_seen = Some(Instant::now()));
+            return;
+        }
+
         if first.msg_type != TYPE_HANDSHAKE {
             tracing::warn!("connection without handshake dropped");
             return;
@@ -983,14 +1402,22 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    fn test_node(name: &str) -> Arc<Mutex<Node>> {
+    pub(crate) fn test_node(name: &str) -> Arc<Mutex<Node>> {
         let mut node = Node::new(name, 0);
         node.flush_every = Duration::from_millis(50);
         node.idle_flush = Duration::from_millis(100);
         Arc::new(Mutex::new(node))
     }
 
-    async fn start_node(name: &str) -> (Arc<Mutex<Node>>, String) {
+    pub(crate) fn test_node_mode(name: &str, mode: CryptoMode) -> Arc<Mutex<Node>> {
+        let mut node = Node::new(name, 0);
+        node.flush_every = Duration::from_millis(50);
+        node.idle_flush = Duration::from_millis(100);
+        node.set_crypto_mode(mode);
+        Arc::new(Mutex::new(node))
+    }
+
+    pub(crate) async fn start_node(name: &str) -> (Arc<Mutex<Node>>, String) {
         let node = test_node(name);
         let (tx, rx) = oneshot::channel();
         let n2 = node.clone();
@@ -1001,11 +1428,25 @@ mod tests {
         (node, invite)
     }
 
-    async fn cmd(node: &Arc<Mutex<Node>>, line: &str) {
+    pub(crate) async fn start_node_mode(
+        name: &str,
+        mode: CryptoMode,
+    ) -> (Arc<Mutex<Node>>, String) {
+        let node = test_node_mode(name, mode);
+        let (tx, rx) = oneshot::channel();
+        let n2 = node.clone();
+        tokio::spawn(async move {
+            let _ = run(n2, mpsc::unbounded_channel().1, Some(tx)).await;
+        });
+        let invite = rx.await.expect("invite");
+        (node, invite)
+    }
+
+    pub(crate) async fn cmd(node: &Arc<Mutex<Node>>, line: &str) {
         node.lock().await.handle_command(line).await;
     }
 
-    async fn wait_for<F, Fut>(mut cond: F, timeout_ms: u64)
+    pub(crate) async fn wait_for<F, Fut>(mut cond: F, timeout_ms: u64, what: &str)
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = bool>,
@@ -1017,7 +1458,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("condition not met within {timeout_ms}ms");
+        panic!("condition not met within {timeout_ms}ms: {what}");
     }
 
     #[tokio::test]
@@ -1059,6 +1500,7 @@ mod tests {
         wait_for(
             || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
             3000,
+            "a+b peer 1",
         )
         .await;
 
@@ -1066,6 +1508,7 @@ mod tests {
         wait_for(
             || async { a.lock().await.history_texts("default").len() == 1 },
             3000,
+            "a history hello",
         )
         .await;
         assert_eq!(
@@ -1081,7 +1524,12 @@ mod tests {
         let (c, _inv_c) = start_node("carol").await;
 
         cmd(&b, &format!("/join {invite}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
 
         // Same invite again: nonce already consumed -> rejected.
         cmd(&c, &format!("/join {invite}")).await;
@@ -1097,17 +1545,28 @@ mod tests {
         let (c, _inv_c) = start_node("carol").await;
 
         cmd(&b, &format!("/join {invite_a}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
         // Fresh one-time invite for carol.
         let invite_a2 = a.lock().await.invite_now();
         cmd(&c, &format!("/join {invite_a2}")).await;
-        wait_for(|| async { a.lock().await.peer_count() == 2 }, 3000).await;
+        wait_for(
+            || async { a.lock().await.peer_count() == 2 },
+            3000,
+            "a peer 2",
+        )
+        .await;
 
         // Bob sends: relay alice -> carol must deliver it.
         cmd(&b, "/send default from bob").await;
         wait_for(
             || async { c.lock().await.history_texts("default").len() == 1 },
             3000,
+            "c local secret",
         )
         .await;
 
@@ -1126,6 +1585,7 @@ mod tests {
                     .contains(&"local secret".to_string())
             },
             3000,
+            "histories converge",
         )
         .await;
         wait_for(
@@ -1136,6 +1596,7 @@ mod tests {
                     .contains(&"local secret".to_string())
             },
             3000,
+            "len 2",
         )
         .await;
 
@@ -1153,7 +1614,12 @@ mod tests {
         let (a, invite) = start_node("alice").await;
         let (b, _inv_b) = start_node("bob").await;
         cmd(&b, &format!("/join {invite}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
 
         cmd(&b, "/flood 50 default").await;
         wait_for(
@@ -1165,6 +1631,7 @@ mod tests {
                     .any(|s| s.contains("S1 Alert"))
             },
             5000,
+            "a s1 alert",
         )
         .await;
         // Sender-side self check also fires.
@@ -1181,7 +1648,12 @@ mod tests {
         let (a, invite) = start_node("alice").await;
         let (b, _inv_b) = start_node("bob").await;
         cmd(&b, &format!("/join {invite}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
 
         cmd(&b, "/decoy").await;
         wait_for(
@@ -1193,6 +1665,7 @@ mod tests {
                     .any(|s| s.contains("S7 Alert"))
             },
             3000,
+            "s1 alert",
         )
         .await;
     }
@@ -1202,13 +1675,222 @@ mod tests {
         let (a, invite) = start_node("alice").await;
         let (b, _inv_b) = start_node("bob").await;
         cmd(&b, &format!("/join {invite}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "a peer 1",
+        )
+        .await;
 
         cmd(&b, "/flood 150 default").await;
-        wait_for(|| async { a.lock().await.inbox.len() >= 100 }, 5000).await;
+        wait_for(
+            || async { a.lock().await.inbox.len() >= 100 },
+            5000,
+            "inbox 100",
+        )
+        .await;
         let inbox = &a.lock().await.inbox;
         assert!(inbox.len() <= 100);
         assert!(inbox.messages().back().unwrap().text.contains("flood 149"));
         assert!(!inbox.messages().front().unwrap().text.contains("flood 0"));
+    }
+}
+
+#[cfg(test)]
+mod ratchet_mode_tests {
+    //! Этап A интеграция: X3DH + Double Ratchet поверх существующего
+    //! транспорта (MUSH-A-SPEC §5). Legacy-режим не тронут — dual-mode CI.
+    use super::tests::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn ratchet_mode_two_nodes_exchange() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let (b, _invite_b) = start_node_mode("bob", CryptoMode::Ratchet).await;
+        assert!(invite_a.contains("pk="), "invite несёт pk= bundle");
+
+        cmd(&b, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
+
+        cmd(&b, "/send default hello over ratchet").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"hello over ratchet".to_string())
+            },
+            3000,
+            "a got hello ratchet",
+        )
+        .await;
+
+        cmd(&a, "/send default reply over ratchet").await;
+        wait_for(
+            || async {
+                b.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"reply over ratchet".to_string())
+            },
+            3000,
+            "b got reply",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ratchet_mode_four_nodes_converge_via_relay_and_sync() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let (b, _ib) = start_node_mode("bob", CryptoMode::Ratchet).await;
+        let (c, _ic) = start_node_mode("carol", CryptoMode::Ratchet).await;
+        let (d, _id) = start_node_mode("dave", CryptoMode::Ratchet).await;
+
+        cmd(&b, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
+        let invite_a2 = a.lock().await.invite_now();
+        cmd(&c, &format!("/join {invite_a2}")).await;
+        wait_for(
+            || async { a.lock().await.peer_count() == 2 },
+            3000,
+            "a peer 2",
+        )
+        .await;
+        let invite_a3 = a.lock().await.invite_now();
+        cmd(&d, &format!("/join {invite_a3}")).await;
+        wait_for(
+            || async { a.lock().await.peer_count() == 3 },
+            3000,
+            "a peer 3",
+        )
+        .await;
+
+        // Bob -> все (relay через alice).
+        cmd(&b, "/send default from bob").await;
+        wait_for(
+            || async {
+                d.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"from bob".to_string())
+            },
+            3000,
+            "d got from bob",
+        )
+        .await;
+
+        // Alice appends локально БЕЗ broadcast; carol и dave догоняют /sync.
+        a.lock()
+            .await
+            .append_local_only("default", "local secret")
+            .unwrap();
+        cmd(&c, "/sync default").await;
+        cmd(&d, "/sync default").await;
+        cmd(&b, "/sync default").await;
+        wait_for(
+            || async {
+                d.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"local secret".to_string())
+            },
+            3000,
+            "d got local secret",
+        )
+        .await;
+
+        // Истории сходятся на всех четырёх.
+        let ha = a.lock().await.history_texts("default");
+        let hb = b.lock().await.history_texts("default");
+        let hc = c.lock().await.history_texts("default");
+        let hd = d.lock().await.history_texts("default");
+        assert_eq!(ha, hb);
+        assert_eq!(hb, hc);
+        assert_eq!(hc, hd);
+        assert_eq!(ha.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ratchet_mode_session_export_import_continues() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let (b, _ib) = start_node_mode("bob", CryptoMode::Ratchet).await;
+        cmd(&b, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
+
+        cmd(&b, "/send default before persist").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"before persist".to_string())
+            },
+            3000,
+            "a got before persist",
+        )
+        .await;
+
+        // Persist bob'овой сессии с alice, импорт обратно (roundtrip API).
+        let peer_key_a = a.lock().await.pubkey();
+        let state = b
+            .lock()
+            .await
+            .export_peer_session(&peer_key_a)
+            .expect("session exported");
+        assert!(b.lock().await.import_peer_session(&peer_key_a, &state));
+
+        // Обмен продолжается в обе стороны после restore.
+        cmd(&b, "/send default after persist").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"after persist".to_string())
+            },
+            3000,
+            "a got after persist",
+        )
+        .await;
+        cmd(&a, "/send default back to bob").await;
+        wait_for(
+            || async {
+                b.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"back to bob".to_string())
+            },
+            3000,
+            "b got back to bob",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ratchet_mode_invite_roundtrip_tolerates_unknown_fields() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let parsed = Invite::parse(&invite_a).unwrap();
+        assert!(parsed.pk.is_some());
+        // Tolerant parsing: неизвестное поле не ломает invite.
+        let tampered = format!("{invite_a}&futurefield=xyz123");
+        let parsed2 = Invite::parse(&tampered).unwrap();
+        assert_eq!(parsed2.pk, parsed.pk);
+        assert_eq!(parsed2.group_id, parsed.group_id);
+        let _ = a.lock().await.peer_count();
     }
 }
