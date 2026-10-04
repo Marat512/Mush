@@ -103,7 +103,9 @@ jobs:
             -o app/src/main/jniLibs build --release -p mush-jni
 
       - name: Assemble debug APK
-        run: ./gradlew assembleDebug
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug
 
       - name: Verify .so inside APK
         run: |
