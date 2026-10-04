@@ -1,0 +1,13 @@
+[package]
+name = "mush-jni"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "JNI bridge: Kotlin <-> mush-core (Mush A' Android)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mush-core = { path = "../../mush-core" }
+jni = "0.21"
