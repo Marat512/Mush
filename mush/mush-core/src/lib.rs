@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod framing;
 pub mod identity;
 pub mod sns;
 
