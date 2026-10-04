@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["mush-core", "mush-cli", "mush-jni"]
+
+# MUSH-A'-ANDROID-SPEC §4.2: release — lto + strip symbols (главный
+# потребитель release-артефакта — libmush_jni.so для APK).
+[profile.release]
+lto = "thin"
+strip = "symbols"
