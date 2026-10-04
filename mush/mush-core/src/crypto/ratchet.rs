@@ -230,6 +230,148 @@ impl PreKeyStore {
     }
 }
 
+/// Потребитель бандлов (initiator). Tombstone использованных OPK —
+/// повторный старт сессии с тем же OPK отклоняется ДО ухода в сеть
+/// (дублирует responder-side защиту, ловит баги инициатора локально;
+/// MUSH-A-SPEC §4.1). TTL — логический счётчик потребителя.
+pub struct BundleConsumer {
+    used: std::collections::BTreeMap<(u32, Option<u32>), u64>,
+    logical_clock: u64,
+}
+
+impl BundleConsumer {
+    pub fn new() -> Self {
+        BundleConsumer {
+            used: std::collections::BTreeMap::new(),
+            logical_clock: 0,
+        }
+    }
+
+    /// Отметить бандл как израсходованный. false — такой OPK уже был
+    /// использован (повторное использование — отказ).
+    pub fn mark_used(&mut self, bundle: &PreKeyBundle) -> bool {
+        self.logical_clock += 1;
+        let key = (bundle.spk_id, bundle.opk_id);
+        if self.used.contains_key(&key) {
+            return false;
+        }
+        self.used.insert(key, self.logical_clock);
+        true
+    }
+
+    /// Явная чистка просроченных записей (TTL по логическому счётчику).
+    pub fn prune_expired(&mut self) {
+        let cutoff = self.logical_clock.saturating_sub(SEEN_TTL_LOGICAL);
+        self.used.retain(|_, ts| *ts > cutoff);
+    }
+}
+
+impl Default for BundleConsumer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Пакетный манифест pre-keys для DTN-распространения (MUSH-A-SPEC §4.1):
+/// один подписанный payload несёт до MANIFEST_MAX_KEYS одноразовых ключей,
+/// сериализуется под MANIFEST_MAX_BYTES. Подпись — от identity-ключа
+/// владельца (SPK-подпись каждого ключа не нужна: манифест целиком авторизован).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreKeyManifest {
+    pub identity: [u8; 32],
+    pub spk_id: u32,
+    pub spk: [u8; 32],
+    pub spk_sig_r: [u8; 32],
+    pub spk_sig_s: [u8; 32],
+    /// (opk_id, opk_public) — до MANIFEST_MAX_KEYS.
+    pub opks: Vec<(u32, [u8; 32])>,
+    /// Wall-clock публикации: TTL манифеста 30 дней (узловой уровень).
+    pub published_at_ms: u64,
+    /// Подпись identity-ключом владельца над телом манифеста (canonical).
+    pub sig_r: [u8; 32],
+    pub sig_s: [u8; 32],
+}
+
+fn manifest_body(m: &PreKeyManifest) -> Vec<u8> {
+    let mut b = Vec::with_capacity(96 + m.opks.len() * 36);
+    b.extend_from_slice(b"mush-manifest");
+    b.extend_from_slice(&m.identity);
+    b.extend_from_slice(&m.spk_id.to_le_bytes());
+    b.extend_from_slice(&m.spk);
+    b.extend_from_slice(&m.published_at_ms.to_le_bytes());
+    for (id, pk) in &m.opks {
+        b.extend_from_slice(&id.to_le_bytes());
+        b.extend_from_slice(pk);
+    }
+    b
+}
+
+impl PreKeyManifest {
+    pub const TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+    pub const MAX_KEYS: usize = MANIFEST_MAX_KEYS;
+    pub const MAX_BYTES: usize = MANIFEST_MAX_BYTES;
+
+    /// Манифест из текущего состояния хранилища: забирает до `max` ключей
+    /// из pending в published (как publish_bundle, но пакетно). Подписывает
+    /// манифест identity-ключом владельца.
+    pub fn publish(store: &mut PreKeyStore, max: usize) -> Self {
+        let max = max.min(MANIFEST_MAX_KEYS);
+        let mut opks = Vec::with_capacity(max);
+        for _ in 0..max {
+            let Some(id) = store.pending.keys().min().copied() else {
+                break;
+            };
+            let key = store.pending.remove(&id).expect("pending key");
+            let public = key.public;
+            store.published.insert(id, key);
+            opks.push((id, public));
+        }
+        let mut m = PreKeyManifest {
+            identity: store.identity.pubkey_bytes(),
+            spk_id: store.spk.key_id,
+            spk: store.spk.public,
+            spk_sig_r: store.spk.signature[..32].try_into().expect("sig R"),
+            spk_sig_s: store.spk.signature[32..].try_into().expect("sig S"),
+            opks,
+            published_at_ms: now_millis(),
+            sig_r: [0u8; 32],
+            sig_s: [0u8; 32],
+        };
+        let sig = store.identity.sign(&manifest_body(&m));
+        m.sig_r = sig[..32].try_into().expect("sig R");
+        m.sig_s = sig[32..].try_into().expect("sig S");
+        m
+    }
+
+    /// Проверка подписи манифеста (получатель обязан проверять до хранения).
+    pub fn verify(&self) -> bool {
+        Identity::verify(
+            &self.identity,
+            &manifest_body(self),
+            &sig64(&self.sig_r, &self.sig_s),
+        )
+    }
+
+    /// Бандл для одного инициатора: забирает один OPK из манифеста
+    /// (каждый OPK отдаётся один раз — одноразовость на уровне манифеста).
+    pub fn take_bundle(&mut self) -> Option<PreKeyBundle> {
+        let (opk_id, opk) = self.opks.pop()?;
+        Some(PreKeyBundle {
+            identity: self.identity,
+            spk_id: self.spk_id,
+            spk: self.spk,
+            spk_sig_r: self.spk_sig_r,
+            spk_sig_s: self.spk_sig_s,
+            opk_id: Some(opk_id),
+            opk: Some(opk),
+        })
+    }
+
+    pub fn is_expired(&self) -> bool {
+        now_millis().saturating_sub(self.published_at_ms) > Self::TTL_MS
+    }
+}
+
 /// Первый фрейм сессии: initiator → responder. Передаётся открыто (ephemeral
 /// не подписывается; аутентичность обеспечивается AEAD первого сообщения с AD).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,14 +526,19 @@ fn root_kdf(root_key: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 const MAX_SKIPPED: usize = 200;
 /// Максимальный разрыв индексов, который мы готовы догнать внутри цепи.
 const MAX_CHAIN_GAP: u32 = 100;
-/// TTL skipped keys: 7 суток (MUSH-A-SPEC §3).
-const SKIPPED_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
+/// TTL skipped keys по ЛОГИЧЕСКОМУ счётчику сессии (события encrypt/decrypt):
+/// у устройств в поле часы могут быть сбиты (MUSH-A-SPEC §4).
+const SKIPPED_TTL_LOGICAL: u64 = 10_000;
 /// LRU-потолок seen_ratchet_keys (MUSH-A-SPEC §4).
 const SEEN_CAP: usize = 1000;
-/// TTL записей seen_ratchet_keys: 30 суток.
-const SEEN_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
-/// TTL tombstone used_pre_keys: 30 суток (MUSH-A-SPEC §1).
+/// TTL seen_ratchet_keys по логическому счётчику.
+const SEEN_TTL_LOGICAL: u64 = 100_000;
+/// TTL tombstone used_pre_keys: 30 суток, wall-clock узла (MUSH-A-SPEC §1):
+/// ошибка часа меняет только срок хранения, безопасность не ломается.
 const USED_PREKEY_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+/// Лимиты bundle-манифеста (MUSH-A-SPEC §4.1).
+pub const MANIFEST_MAX_KEYS: usize = 100;
+pub const MANIFEST_MAX_BYTES: usize = 16_384;
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -423,8 +570,11 @@ pub struct RatchetSession {
     /// Все ratchet-ключи пира, через которые мы уже прошли (текущий +
     /// прежние). Ключ вне этого набора — НОВЫЙ (ratchet-шаг); ключ из
     /// набора, но не текущий — старая цепочка, только skipped-lookup.
-    /// LRU cap SEEN_CAP, TTL SEEN_TTL_MS.
+    /// LRU cap SEEN_CAP, TTL по logical_clock.
     seen_ratchet_keys: std::collections::HashMap<[u8; 32], u64>,
+    /// Логический счётчик сессии: +1 на каждый encrypt/decrypt. Основа TTL
+    /// skipped/seen — у устройств в поле часы могут быть сбиты.
+    logical_clock: u64,
 }
 
 impl RatchetSession {
@@ -449,6 +599,7 @@ impl RatchetSession {
             ad: start.ad,
             spk_secret: None,
             seen_ratchet_keys: std::collections::HashMap::new(),
+            logical_clock: 0,
         }
     }
 
@@ -468,11 +619,13 @@ impl RatchetSession {
             ad: start.ad,
             spk_secret: Some(spk_secret),
             seen_ratchet_keys: std::collections::HashMap::new(),
+            logical_clock: 0,
         }
     }
 
     /// Шифрует сообщение. Респондер до обработки первого сообщения вернёт None.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Option<RatchetMessage> {
+        self.logical_clock += 1;
         let chain = self.send_chain.as_mut()?;
         let ratchet_key = x25519_public(&self.dhs);
         let (next, mk) = chain.step();
@@ -496,6 +649,7 @@ impl RatchetSession {
     /// None при невалидном ключе, израсходованном индексе (replay) или
     /// слишком большом разрыве (DoS-страж).
     pub fn decrypt(&mut self, msg: &RatchetMessage) -> Option<Vec<u8>> {
+        self.logical_clock += 1;
         let remote_key = msg.header.ratchet_key;
         let n = msg.header.chain_index;
 
@@ -512,19 +666,22 @@ impl RatchetSession {
             self.root_key = root;
             self.send_chain = Some(ChainKey { key: ck, index: 0 });
             self.dhr = Some(remote_key);
-            self.seen_ratchet_keys.insert(remote_key, now_millis());
+            self.seen_ratchet_keys
+                .insert(remote_key, self.logical_clock);
             self.prev_send_len = 0;
         } else if self.dhr == Some(remote_key) {
             // Текущая цепочка — ничего не делаем.
-            self.seen_ratchet_keys.insert(remote_key, now_millis());
+            self.seen_ratchet_keys
+                .insert(remote_key, self.logical_clock);
         } else if let Some(ts) = self.seen_ratchet_keys.get_mut(&remote_key) {
             // Старая цепочка: сообщение открывается ТОЛЬКО skipped-ключом.
-            *ts = now_millis();
+            *ts = self.logical_clock;
             let (mk, _) = self.skipped.remove(&(remote_key, n))?;
             return aes_gcm_decrypt_aad(&mk, &msg.ciphertext, &msg.nonce, &self.ad);
         } else {
             // Новый ratchet-ключ пира: DH-ratchet шаг.
-            self.seen_ratchet_keys.insert(remote_key, now_millis());
+            self.seen_ratchet_keys
+                .insert(remote_key, self.logical_clock);
             self.evict_seen_if_needed();
             self.ratchet(remote_key, msg.header.prev_chain_len)?;
         }
@@ -542,7 +699,7 @@ impl RatchetSession {
             return None;
         }
         // Догоняем цепочку до n; промежуточные msg keys уходят в skipped.
-        let now = now_millis();
+        let now = self.logical_clock;
         let mut mk = None;
         for _ in 0..=gap {
             let (next, key) = chain.step();
@@ -567,7 +724,7 @@ impl RatchetSession {
     /// рассинхронизируется (парирующие DH: DH(our, their) == DH(their, our)).
     fn ratchet(&mut self, remote_key: [u8; 32], pn: u32) -> Option<()> {
         if let Some(chain) = self.recv_chain.as_mut() {
-            let now = now_millis();
+            let now = self.logical_clock;
             while chain.index < pn {
                 let (next, mk) = chain.step();
                 self.skipped.insert((self.dhr?, chain.index), (mk, now));
@@ -602,10 +759,16 @@ impl RatchetSession {
         self.skipped.len()
     }
 
-    /// Удаляет просроченные skipped keys.
-    fn prune_skipped(&mut self) {
-        let cutoff = now_millis().saturating_sub(SKIPPED_TTL_MS);
-        self.skipped.retain(|_, (_, created)| *created > cutoff);
+    /// Удаляет просроченные skipped/seen по логическому счётчику.
+    /// Явный вызов — export_state не мутирует (идемпотентен, MUSH-A-SPEC §3).
+    pub fn prune_expired(&mut self) {
+        let skipped_cutoff = self.logical_clock.saturating_sub(SKIPPED_TTL_LOGICAL);
+        self.skipped
+            .retain(|_, (_, created)| *created > skipped_cutoff);
+        let seen_cutoff = self.logical_clock.saturating_sub(SEEN_TTL_LOGICAL);
+        self.seen_ratchet_keys.retain(|_, ts| *ts > seen_cutoff);
+        self.evict_seen_if_needed();
+        self.evict_skipped_if_needed();
     }
 
     /// Eviction skipped до MAX_SKIPPED (FIFO по ключу карты — BTreeMap
@@ -645,12 +808,14 @@ pub struct RatchetSessionState {
     pub root_key: [u8; 32],
     pub dhs: [u8; 32],
     pub dhr: Option<[u8; 32]>,
+    /// Логический счётчик сессии (события encrypt/decrypt) — осень TTL.
+    pub logical_clock: u64,
     pub send_chain: Option<([u8; 32], u32)>,
     pub recv_chain: Option<([u8; 32], u32)>,
     pub prev_send_len: u32,
-    /// ((ratchet_key, index), (msg_key, created_at))
+    /// ((ratchet_key, index), (msg_key, created_at_logical))
     pub skipped: Vec<SkippedEntry>,
-    /// (ratchet_key, last_seen)
+    /// (ratchet_key, last_seen_logical)
     pub seen: Vec<SeenEntry>,
     /// AD = IK_A‖IK_B — двумя полями: serde не умеет [u8; 64].
     pub ad_a: [u8; 32],
@@ -658,19 +823,16 @@ pub struct RatchetSessionState {
 }
 
 impl RatchetSession {
-    /// Экспорт состояния: TTL-prune skipped и seen перед записью.
-    /// Инвариант размера (< 8 KB) — в тестах.
-    pub fn export_state(&mut self) -> RatchetSessionState {
-        self.prune_skipped();
-        let now = now_millis();
-        let seen_cutoff = now.saturating_sub(SEEN_TTL_MS);
-        self.seen_ratchet_keys.retain(|_, ts| *ts > seen_cutoff);
-        self.evict_seen_if_needed();
+    /// Экспорт состояния. Чистый (&self), два подряд вызова дают
+    /// идентичный результат; просрочка чистится только явным
+    /// `prune_expired()`. Инвариант размера (< 8 KB) — в тестах.
+    pub fn export_state(&self) -> RatchetSessionState {
         RatchetSessionState {
             version: 1,
             root_key: self.root_key,
             dhs: self.dhs.to_bytes(),
             dhr: self.dhr,
+            logical_clock: self.logical_clock,
             send_chain: self.send_chain.map(|c| (c.key, c.index)),
             recv_chain: self.recv_chain.map(|c| (c.key, c.index)),
             prev_send_len: self.prev_send_len,
@@ -704,6 +866,7 @@ impl RatchetSession {
             skipped: state.skipped.iter().map(|(k, v)| (*k, *v)).collect(),
             spk_secret: None,
             seen_ratchet_keys: state.seen.iter().map(|(k, ts)| (*k, *ts)).collect(),
+            logical_clock: state.logical_clock,
             ad,
         })
     }
@@ -984,15 +1147,85 @@ mod tests {
         bob.decrypt(&m0).unwrap();
         bob.decrypt(&m2).unwrap(); // m1 -> skipped (gap)
         assert!(bob.skipped_len() >= 1);
-        // Подстареваем одну запись (имитация старости).
-        let old = now_millis().saturating_sub(SKIPPED_TTL_MS + 1000);
+        // Подстареваем одну запись по ЛОГИЧЕСКОМУ счётчику (имитация старости).
+        let old = bob.logical_clock.saturating_sub(SKIPPED_TTL_LOGICAL + 10);
         let key = *bob.skipped.keys().next().expect("skipped non-empty");
         bob.skipped.insert(key, ([9u8; 32], old));
+        bob.prune_expired();
         let state = bob.export_state();
         assert!(
             state.skipped.iter().all(|(_, (_, ts))| *ts > old),
-            "просроченные skipped должны исчезнуть при export"
+            "просроченные skipped должны исчезнуть при prune_expired"
         );
+    }
+
+    #[test]
+    fn dr_export_is_idempotent() {
+        let (mut alice, mut bob) = dr_pair();
+        let m = alice.encrypt(b"a").unwrap();
+        bob.decrypt(&m).unwrap();
+        let r = bob.encrypt(b"b").unwrap();
+        alice.decrypt(&r).unwrap();
+        // Два подряд export — идентичный результат; export не мутирует.
+        let s1 = alice.export_state();
+        let skipped_before = alice.skipped_len();
+        let s2 = alice.export_state();
+        assert_eq!(s1.logical_clock, s2.logical_clock);
+        assert_eq!(s1.skipped, s2.skipped);
+        assert_eq!(s1.seen, s2.seen);
+        assert_eq!(s1.dhs, s2.dhs);
+        assert_eq!(alice.skipped_len(), skipped_before);
+    }
+
+    #[test]
+    fn bundle_consumer_rejects_opk_reuse() {
+        let (mut bob, _id) = setup();
+        let bundle = bob.publish_bundle();
+        let mut consumer = BundleConsumer::new();
+        assert!(consumer.mark_used(&bundle));
+        // Повтор с тем же бандлом (тот же OPK) — отказ до ухода в сеть.
+        assert!(!consumer.mark_used(&bundle));
+
+        // Через манифест: каждый OPK отдаётся один раз.
+        let mut store2 = PreKeyStore::new(Identity::generate());
+        store2.replenish(3);
+        let mut manifest = PreKeyManifest::publish(&mut store2, MANIFEST_MAX_KEYS);
+        assert!(manifest.verify(), "подпись манифеста валидна");
+        let b1 = manifest.take_bundle().unwrap();
+        let b2 = manifest.take_bundle().unwrap();
+        assert_ne!(b1.opk_id, b2.opk_id);
+        let mut c2 = BundleConsumer::new();
+        assert!(c2.mark_used(&b1));
+        assert!(c2.mark_used(&b2));
+        assert!(!c2.mark_used(&b1), "reuse OPK через манифест — отказ");
+    }
+
+    #[test]
+    fn manifest_size_under_limit_and_handshake_works() {
+        let mut store = PreKeyStore::new(Identity::generate());
+        store.replenish(MANIFEST_MAX_KEYS + 10);
+        let mut manifest = PreKeyManifest::publish(&mut store, MANIFEST_MAX_KEYS + 10);
+        assert!(manifest.verify());
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&manifest, &mut cbor).expect("cbor");
+        assert!(
+            cbor.len() < MANIFEST_MAX_BYTES,
+            "манифест {} bytes >= лимит {}",
+            cbor.len(),
+            MANIFEST_MAX_BYTES
+        );
+
+        // Полный цикл: бандл из манифеста -> X3DH -> DR-сессия.
+        let alice_id = Identity::generate();
+        let bundle = manifest.take_bundle().expect("opk in manifest");
+        let (start, init) = X3dhInitiator::start(&alice_id, &bundle, b"hello").expect("init");
+        let (bob_start, first) = store.complete_handshake(&init).expect("resp");
+        assert_eq!(first, b"hello");
+        let mut alice = RatchetSession::new_initiator(&start, &bundle.spk);
+        let mut bob =
+            RatchetSession::new_responder(&bob_start, store.signed_pre_key_secret().clone());
+        let msg = alice.encrypt(b"ping").unwrap();
+        assert_eq!(bob.decrypt(&msg).unwrap(), b"ping");
     }
 
     #[test]
