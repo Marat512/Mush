@@ -1,162 +1,568 @@
-# MUSH-A'-ANDROID-SPEC — Android-прототип (ТЗ2)
+# MUSH-A'-ANDROID-SPEC — Android прототип (этап A')
 
-**Версия:** 0.1.0
-**Дата:** 2026-10-04
-**Статус:** Draft — ТЗ2, продолжение MUSH-A'-SPEC v0.1.1 / MUSH-A'-CLI-SPEC
-**Предусловие:** CI зелёный на ubuntu + macOS (выполнено, run #3)
-**Контракт:** protocol не меняется относительно Rust CLI. Меняются transport (TCP → Hotspot/LAN) и UI (TUI → Compose). Ядро — то же: `mush-core` через JNI.
+**Версия:** 0.1.0  
+**Дата:** 2026-09-29  
+**Статус:** Draft — спецификация Android-прототипа  
+**База:** MUSH-A'-SPEC.md v0.1.1  
+**Предшественник:** MUSH-A'-CLI-SPEC.md v0.1.0 (Rust CLI, проверка логики ядра)  
+**Цель:** Два телефона в одной комнате обмениваются сообщениями через hotspot, без интернета и сервера. Проверка UX-гипотезы: «люди готовы сканировать QR вместо регистрации».
 
 ---
 
-## 0. Жёсткие рамки
+**Отношение к CLI:** тот же протокол, то же ядро (`mush-core`), меняются только transport (TCP → Hotspot) и UI (TUI → Compose). Криптография, framing, CRDT, sensors — переиспользуются через JNI без изменений.
 
-**Не входит (scope freeze):**
-- Этап A: Double Ratchet, pre-keys, BPv7 — НЕТ.
-- Этап E: FSM, кворум, quarantine, CUSUM — НЕТ. `evidence_tier` остаётся заглушкой `Hard`.
-- Push-уведомления, бэкапы, темы оформления, файлы, голосовые — НЕТ.
-- BLE, WiFi-Direct — НЕТ (Hotspot/LAN only, по A'-SPEC §5.1–5.2).
+---
 
-**Входит:** ровно 8 критериев приёмки MUSH-A'-SPEC §8 на 2–4 физических телефонах/эмуляторах.
+## 1. Что входит в A' Android
 
-**Toolchain:**
-- Android Studio (bundled JDK 17+, SDK 34, build-tools 34).
-- NDK 26+ (`cargo-ndk` 3.x) — таргеты `aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android` (последний — для эмулятора).
-- Rust stable + `cargo-ndk`, `jni` crate 0.21.
-- Kotlin, Jetpack Compose BOM 2024.09+, minSdk 26, targetSdk 34.
+| Компонент | Реализация | Чего НЕТ |
+|-----------|-----------|----------|
+| **JNI-мост** | `cdylib` над `mush-core`, `extern "C"` | Полная FFI-обвязка (только нужные функции) |
+| **Hotspot transport** | `WifiManager.startLocalOnlyHotspot` | WiFi-Direct P2P, BLE |
+| **LAN fallback** | Оба телефона в одной Wi-Fi, IP через QR | mDNS, autodiscovery |
+| **QR** | ZXing (scan + generate) | NFC, invite-link с deep link |
+| **UI** | Jetpack Compose, 6 экранов | Темы, анимации, настройки |
+| **Foreground service** | Одна нотификация, держит сеть | Background workers, push |
+| **Sensors** | S1 threshold, S7 decoy — alerts в UI | CUSUM, FSM, silent mode |
 
-**Репо-структура (добавляется к существующему):**
+---
+
+## 2. Архитектура
+
+```
+┌──────────────────────────────────────────────┐
+│              Kotlin / Compose UI             │
+│  Splash → Onboarding → Chats → Chat          │
+│              Contacts → Alerts               │
+├──────────────────────────────────────────────┤
+│              Kotlin Service Layer            │
+│  MushService (foreground)                    │
+│  NetworkManager (hotspot/LAN)                │
+│  QrManager (scan/generate)                   │
+│  StateFlow<UiState>                          │
+├──────────────────────────────────────────────┤
+│              JNI Bridge                      │
+│  Native.kt (external fun declarations)       │
+│  MushCallback (Kotlin → Rust callbacks)      │
+├──────────────────────────────────────────────┤
+│              mush-jni (Rust cdylib)          │
+│  extern "C" wrappers                         │
+│  Tokio runtime (on dedicated thread)         │
+│  GlobalRef to Kotlin callback object         │
+├──────────────────────────────────────────────┤
+│              mush-core (Rust library)        │
+│  identity, sns, framing, crdt, sensors       │
+│  transport: TCP (LAN) — переиспользуется     │
+└──────────────────────────────────────────────┘
+```
+
+**Ключевое:** `mush-core` не модифицируется. Hotspot поднимается в Kotlin, TCP-сокет между телефонами — тот же, что в CLI. `mush-core` думает, что работает на localhost.
+
+---
+
+## 3. Структура репозитория
 
 ```
 mush/
-├── mush-core/            # БЕЗ ИЗМЕНЕНИЙ (jar/CLI тоже без изменений)
-├── mush-cli/             # БЕЗ ИЗМЕНЕНИЙ
-└── mush-android/         # НОВОЕ: Gradle-проект
-    ├── app/              # Kotlin + Compose UI
-    │   └── src/main/...
-    │       └── jniLibs/  # .so собираются cargo-ndk, не коммитятся
-    ├── mush-jni/         # Rust crate: extern "C" мост над mush-core
+├── Cargo.toml                    # workspace
+├── mush-core/                    # Rust library (не меняется)
+├── mush-cli/                     # Rust CLI (не меняется)
+├── mush-jni/                     # НОВОЕ: cdylib для Android
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs                # extern "C" экспорты
+│       ├── runtime.rs            # Tokio runtime singleton
+│       ├── callback.rs           # GlobalRef + attach_current_thread
+│       └── errors.rs             # Result → Throwable
+└── mush-android/                 # НОВОЕ: Android Studio project
+    ├── app/
+    │   ├── build.gradle.kts
+    │   ├── src/main/
+    │   │   ├── AndroidManifest.xml
+    │   │   ├── java/app/mush/
+    │   │   │   ├── MainActivity.kt
+    │   │   │   ├── Native.kt             # external fun + init
+    │   │   │   ├── MushService.kt        # foreground service
+    │   │   │   ├── NetworkManager.kt     # hotspot/LAN
+    │   │   │   ├── QrManager.kt          # ZXing wrapper
+    │   │   │   └── ui/                   # Compose screens
+    │   │   └── res/
+    │   └── jniLibs/                      # .so от cargo-ndk
     └── build.gradle.kts
 ```
 
 ---
 
-## Фазы
+## 4. Setup
 
-### Фаза 0 — Milestone 0: «Hello from Rust» в APK (1 день)
+### 4.1. Rust toolchain
 
-**Цель:** доказать, что Rust-код исполняется внутри APK раньше любого UI-сложности. Если JNI-мост не работает — всё остальное бессмысленно.
+```bash
+# Установка NDK-таргетов
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
 
-1. `mush-jni` crate: `cdylib`, зависимость `mush-core`, `jni = "0.21"`.
-2. Одна функция:
+# cargo-ndk
+cargo install cargo-ndk
 
-```rust
-#[no_mangle]
-pub extern "C" fn Java_app_mush_core_MushCore_hello<'local>(
-    mut env: JNIEnv<'local>, _class: JClass<'local>
-) -> JString<'local> {
-    let identity = mush_core::identity::Identity::generate();
-    let key = mush_core::base64::encode(&identity.pubkey_bytes());
-    env.new_string(format!("Hello from Rust! Ed25519 key: {key}"))
-       .expect("JVM string")
+# Сборка .so
+cd mush-jni
+cargo ndk -t arm64-v8a -t armeabi-v7a -o ../mush-android/app/src/main/jniLibs build --release
+```
+
+NDK version: r26+ (для API 26+; у r25 ломается `libc++_shared.so` linking).
+
+### 4.2. mush-jni/Cargo.toml
+
+```toml
+[package]
+name = "mush-jni"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mush-core = { path = "../mush-core" }
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+once_cell = "1"
+tracing = "0.1"
+tracing-android = "0.2"
+
+[profile.release]
+lto = true
+strip = "symbols"
+```
+
+### 4.3. app/build.gradle.kts (фрагмент)
+
+```kotlin
+android {
+    compileSdk = 34
+    defaultConfig {
+        minSdk = 26
+        targetSdk = 34
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+    sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+}
+
+dependencies {
+    implementation("androidx.activity:activity-compose:1.8.0")
+    implementation("androidx.navigation:navigation-compose:2.7.5")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.google.zxing:core:3.5.2")
 }
 ```
 
-3. Kotlin: `object MushCore { init { System.loadLibrary("mush_jni") } external fun hello(): String }`
-4. Compose: один экран, `Text(MushCore.hello())`, по центру.
-5. Сборка: `cargo ndk -t aarch64 -t x86_64 -o app/src/main/jniLibs build --release`, далее `./gradlew assembleDebug`.
-6. **Приёмка MS0:** APK установлен на эмуляторе (x86_64) и физическом устройстве (aarch64), на экране строка `Hello from Rust! Ed25519 key: <base64>` — разная на каждом устройстве (ключ генерируется при вызове).
+---
 
-**Риски:** cargo-ndk не видит NDK (флаг `-p`), ABI-несовпадение эмулятора (лечится x86_64 таргетом), `UnsatisfiedLinkError` (порядок `loadLibrary` / отсутствие .so в apk → проверить `unzip -l`).
+## 5. JNI-контракт
 
-### Фаза 1 — JNI-мост ядра (1–1.5 дня)
+### 5.1. Rust-side: extern "C" функции
 
-**Цель:** Kotlin управляет нодой `mush-core` как в CLI: lifecycle, команды, события.
+```rust
+// mush-jni/src/lib.rs
+use jni::objects::{JClass, JString, JObject};
+use jni::sys::{jstring, jlong, jboolean, jbyteArray, jint};
+use jni::JNIEnv;
 
-Обернуть минимальный API (state machine ноды живёт в Rust, Kotlin — тонкий клиент):
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_init(
+    mut env: JNIEnv, _class: JClass,
+    data_dir: JString,
+    callback: JObject,       // Kotlin callback object
+) -> jlong;                  // handle (pointer as i64)
 
-| Rust (`mush-jni`) | Kotlin вызов | Комментарий |
-|---|---|---|
-| `nodeCreate(name, port) -> jlong` | `MushCore.create(name, port): Long` | handle = Box::into_raw(Node) |
-| `nodeStart(handle)` | `start()` | spawn accept loop в tokio runtime (один глобальный) |
-| `nodeInvite(handle) -> String` | `invite(): String` | `mush://` строка |
-| `nodeJoin(handle, invite)` | `join(invite)` | блокирующий, из Dispatchers.IO |
-| `nodeSend(handle, group, text)` | `send(group, text)` | |
-| `nodePollEvents(handle) -> String[]` | `pollEvents(): List<String>` | JSON-строки событий: `message`, `alert`, `contact`, `status` |
-| `nodeDestroy(handle)` | `close()` | drop Box, остановить runtime-задачи |
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_pubkey(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+) -> jstring;                // base64 pubkey
 
-Правила JNI:
-- Все `jlong`-handle'и валидируются (null → `MushJniException`).
-- Ошибки Rust → `throw_new("app/mush/core/MushJniException", msg)`, не краш нативно.
-- `pollEvents` — pull-модель (Kotlin тикает корутиной каждые 200 мс), потому что callback из Rust в Kotlin через `JavaVM` слишком хрупок для A'. Pull достаточен.
-- Node не `Send` между потоками JVM — мост сериализует вызовы через один глобальный мьютекс (A' однопользовательский, норм).
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_invite(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+) -> jstring;                // "mush://<pubkey>#<nonce>"
 
-**Приёмка:** юнит-тест на JVM-host ( Robolectric НЕ нужен — тесты только Rust-стороны JNI-функций с фейковым JNIEnv невозможны; вместо этого: `cargo test` в `mush-jni` покрывает логику обёртки без JVM) + инструментальный тест: create → invite → join (две ноды в одном процессе, порты 18001/18002) → send → pollEvents содержит `message`.
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_join(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+    invite: JString,
+) -> jboolean;               // true if handshake initiated
 
-### Фаза 2 — Transport: Hotspot + LAN-fallback (1–1.5 дня)
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_start_listener(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+    port: jint,              // 0 = auto
+) -> jint;                   // actual port
 
-**Цель:** заменить `127.0.0.1` на реальные устройства в одной комнате.
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_connect(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+    host: JString,
+    port: jint,
+) -> jboolean;
 
-1. **Hotspot-режим (primary):** `WifiManager.startLocalOnlyHotspot()`. AP-имя `Mush-XXXX` (`group_id[0..4]` hex). Permissions: `NEARBY_WIFI_DEVICES` (API 33+, `neverForLocation`) / `ACCESS_FINE_LOCATION` (< 33). `LocalOnlyHotspotCallback` → onStarted даёт `WifiConfiguration` с softApConfiguration; IP owner'а — через `ConnectivityManager.getLinkProperties(network).linkAddresses` (НЕ хардкод 192.168.43.1).
-2. **LAN-fallback (спека §5.1, зафиксирован):** если permission отклонён или hotspot не поднялся — оба устройства в одной внешней Wi-Fi сети; IP owner'а через тот же NetworkInterface API, в QR как обычно. UI-бейдж «LAN mode».
-3. Клиент: сканирует SSID не нужно — IP+port приходят из QR (как в CLI invite). Подключение — обычный `java.net.Socket` / tokio TCP в Rust-ядре (transport.rs уже TCP — менять почти нечего, только bind 0.0.0.0 и адрес из invite).
-4. Двусторонний обмен: owner accept'ит, joiner коннектится — симметрично CLI.
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_send(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+    group_id: JString,
+    text: JString,
+) -> jboolean;
 
-**Приёмка:** два эмулятора/телефона: owner поднимает hotspot (или LAN), joiner сканирует QR, handshake проходит, сообщение доходит. Airplane-mode проверка отложена до физических устройств (эмуляторы airplane-mode не делают).
+#[no_mangle]
+pub extern "system" fn Java_app_mush_Native_shutdown(
+    mut env: JNIEnv, _class: JClass,
+    handle: jlong,
+);
+```
 
-### Фаза 3 — UI: Compose-экраны (1–2 дня)
+### 5.2. Kotlin-side
 
-Экраны строго по MUSH-A'-SPEC §7.1:
+```kotlin
+// Native.kt
+object Native {
+    init { System.loadLibrary("mush_jni") }
+    
+    external fun init(dataDir: String, callback: MushCallback): Long
+    external fun pubkey(handle: Long): String
+    external fun invite(handle: Long): String
+    external fun join(handle: Long, invite: String): Boolean
+    external fun startListener(handle: Long, port: Int): Int
+    external fun connect(handle: Long, host: String, port: Int): Boolean
+    external fun send(handle: Long, groupId: String, text: String): Boolean
+    external fun shutdown(handle: Long)
+}
 
-| Экран | Содержимое | MS |
-|---|---|---|
-| **Splash** | логотип + «Создаём ваш защищённый ключ…» (~2с, фактически nodeCreate) | 3 |
-| **Onboarding** | имя + идентикон (генерация из pubkey: 5×5 зеркальная матрица, 2 цвета из blake3(pubkey)) + кнопка «Показать QR» | 3 |
-| **Chats** | список групп, FAB «+» (создать / присоединиться по QR) | 3 |
-| **Chat** | сообщения, статус ✓/✓✓/⏳, ввод | 3 |
-| **Contacts** | список, «Поделиться контактом» (показ QR invite) | 3 |
-| **Alerts** | алерты S1/S7, кнопки «Игнорировать» / «Заблокировать» (блокировка = локальный список, удаляет контакт) | 3 |
-| **Debug (скрытый)** | кнопка «Отправить на decoy» (5 тапов по версии) | 3 |
+// MushCallback.kt — интерфейс, реализуемый Kotlin'ом; Rust вызывает его
+interface MushCallback {
+    fun onMessage(groupId: String, senderPubkey: String, text: String, ts: Long)
+    fun onSensorAlert(sensor: String, targetPubkey: String, reason: String)
+    fun onHandshakeComplete(peerPubkey: String)
+    fun onError(code: Int, message: String)
+}
+```
 
-QR: ZXing (`com.google.zxing:core` + `androidx.camera`) — генерировать invite-строку, сканировать. Invite deep-link (`https://mush.app/i#...`) — НЕ в scope (нет сайта); только QR.
+### 5.3. Rust → Kotlin callback
 
-**Приёмка:** все экраны навигабельны, monkey 30 мин без краша (Firebase Test Lab / `adb shell monkey`).
+```rust
+// callback.rs
+pub struct KotlinCallback {
+    vm: JavaVM,
+    obj: GlobalRef,
+}
 
-### Фаза 4 — Критерии приёмки §8 (1 день + демо)
+impl KotlinCallback {
+    pub fn invoke_message(&self, group_id: &str, sender: &str, text: &str, ts: i64) {
+        let mut env = self.vm.attach_current_thread().unwrap();
+        let _ = env.call_method(
+            &self.obj, "onMessage",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V",
+            &[
+                JValue::Object(&env.new_string(group_id).unwrap().into()),
+                JValue::Object(&env.new_string(sender).unwrap().into()),
+                JValue::Object(&env.new_string(text).unwrap().into()),
+                JValue::Long(ts),
+            ],
+        );
+    }
+    // аналогично для остальных
+}
+```
 
-| # | Критерий (MUSH-A'-SPEC §8) | Как проверяем |
-|---|---|---|
-| 1 | Два телефона в комнате обмениваются сообщениями | hotspot/LAN, /send → ✓✓ |
-| 2 | QR-контакт без интернета | airplane mode, QR scan, handshake |
-| 3 | Invite-link с автоподхватом | — (deep-link вне scope; замена: QR-автоподхват) |
-| 4 | Групповой чат 4 человека | 4 устройства, синхронизация через relay |
-| 5 | S1 детектирует аномалию | debug: 50 сообщений подряд → alert |
-| 6 | S7 детектирует decoy | debug-кнопка → alert |
-| 7 | Backpressure | 100+ сообщений, старые удалены |
-| 8 | Нет крашей 30 мин | monkey |
+**Правило:** `attach_current_thread` на каждом callback. Не пытаться держать `JNIEnv` между вызовами — Android-потоки приходят и уходят.
 
-**Демо:** 4 телефона, групповой чат, airplane mode.
+### 5.4. Tokio runtime
+
+```rust
+// runtime.rs
+use once_cell::sync::OnceCell;
+use tokio::runtime::Runtime;
+
+static RUNTIME: OnceCell<Runtime> = OnceCell::new();
+
+pub fn runtime() -> &'static Runtime {
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+    })
+}
+```
+
+Не использовать `block_on` на main thread. JNI-функции возвращают быстро; реальная работа — в runtime через `runtime().spawn(...)`. Результаты приходят в Kotlin через callback.
+
+### 5.5. Ошибки
+
+```rust
+// errors.rs
+pub fn throw(env: &mut JNIEnv, msg: &str) {
+    let _ = env.throw_new("java/lang/RuntimeException", msg);
+}
+```
+
+Все `extern "C"` функции: `match inner(...) { Ok(x) => x, Err(e) => { throw(&mut env, &e.to_string()); default_value } }`.
 
 ---
 
-## Порядок работ
+## 6. Transport: Hotspot + LAN fallback
 
+### 6.1. Hotspot (основной)
+
+```kotlin
+// NetworkManager.kt
+@RequiresApi(Build.VERSION_CODES.O)
+fun startHotspot(context: Context, onReady: (String, Int) -> Unit) {
+    val wifi = context.getSystemService(WifiManager::class.java)
+    val callback = object : WifiManager.LocalOnlyHotspotCallback() {
+        override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
+            val iface = NetworkInterface.getNetworkInterfaces().toList()
+                .firstOrNull { it.name.startsWith("wlan") && it.isUp }
+            val ip = iface?.inetAddresses?.toList()
+                ?.firstOrNull { it is Inet4Address }?.hostAddress
+            onReady(ip ?: "192.168.43.1", PORT)
+        }
+        override fun onFailed(reason: Int) { /* fallback to LAN */ }
+        override fun onStopped() { /* ... */ }
+    }
+    wifi.startLocalOnlyHotspot(callback, Handler(Looper.getMainLooper()))
+}
 ```
-Фаза 0 (MS0) → Фаза 1 → Фаза 2 → Фаза 3 → Фаза 4 → демо
-   1 день     1–1.5 дня  1–1.5 дня  1–2 дня   1 день
+
+IP не хардкодить. Получить через NetworkInterface API — Samsung/Xiaomi/Huawei дают разные.
+
+### 6.2. LAN fallback
+
+Если hotspot не поднялся (permissions, кастомная прошивка, ошибка API):
+
+- Оба телефона в одной Wi-Fi сети.
+- Owner показывает QR с `{ group_id, group_key, ip, port }`.
+- Client сканирует → подключается по TCP.
+- Тот же протокол, тот же framing. Только IP не из hotspot-интерфейса, а из LAN-интерфейса.
+
+### 6.3. Foreground service
+
+```kotlin
+// MushService.kt
+class MushService : Service() {
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val channel = NotificationChannel("mush", "Mush", IMPORTANCE_LOW)
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        
+        val notif = Notification.Builder(this, "mush")
+            .setContentTitle("Mush")
+            .setContentText("Connected to network")
+            .setSmallIcon(R.drawable.ic_mush)
+            .build()
+        
+        startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        return START_STICKY
+    }
+}
 ```
 
-Правило: фаза N+1 не начинается, пока фаза N не показала работающий артефакт на устройстве/эмуляторе. MS0 — раньше всех экранов, без исключений: если «Hello from Rust» не показан на экране телефона, Compose-код не пишется.
+Без foreground service Android убьёт процесс через 5–10 минут. Это не опционально.
 
-## Риск-реестр (обновлён)
+---
+
+## 7. Permissions
+
+| Permission | Зачем | Когда |
+|------------|-------|-------|
+| **INTERNET** | TCP-сокеты | Всегда |
+| **ACCESS_NETWORK_STATE** | Проверка доступности Wi-Fi | Всегда |
+| **NEARBY_WIFI_DEVICES** (API 33+) | Hotspot, Wi-Fi scan | Runtime |
+| **ACCESS_FINE_LOCATION** (API < 33) | Wi-Fi scan (legacy) | Runtime |
+| **CAMERA** | QR-скан | Runtime |
+| **FOREGROUND_SERVICE** | Service | Всегда |
+| **FOREGROUND_SERVICE_CONNECTED_DEVICE** (API 34+) | Service type | Всегда |
+| **POST_NOTIFICATIONS** (API 33+) | Foreground notification | Runtime |
+
+Runtime permissions: hotspot и camera — не даётся автоматически. Обоснование в UI перед запросом: «Mush использует Wi-Fi для связи с другими устройствами без интернета».
+
+Отказ от hotspot permission → LAN fallback. Не блокировать UI.
+
+---
+
+## 8. UI — Compose
+
+### 8.1. Экраны
+
+| Экран | Содержимое |
+|-------|-----------|
+| **Splash** | Логотип, spinner, «Создаём ключ...» (2 сек) |
+| **Onboarding** | Поле имени, идентикон (сгенерирован), кнопка «Далее» |
+| **Chats** | Список групп, FAB «+» → создать/присоединиться |
+| **Chat** | LazyColumn сообщений, поле ввода, статус ✓/✓✓/⏳ |
+| **Contacts** | Список контактов, кнопка «Показать QR» |
+| **Alerts** | Список alerts от S1/S7, действия «Игнорировать» / «Заблокировать» |
+| **QR Scan (modal)** | ZXing scanner view |
+| **QR Show (modal)** | ZXing QR generator с invite-строкой |
+
+### 8.2. State management
+
+```kotlin
+data class UiState(
+    val messages: Map<String, List<Message>> = emptyMap(),
+    val contacts: List<Contact> = emptyList(),
+    val alerts: List<Alert> = emptyList(),
+    val connection: ConnectionState = Disconnected,
+)
+
+class MushViewModel : ViewModel() {
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+    
+    private val callback = object : MushCallback {
+        override fun onMessage(g: String, s: String, t: String, ts: Long) {
+            viewModelScope.launch {
+                _state.update { it.copy(messages = it.messages + ...) }
+            }
+        }
+        // ...
+    }
+}
+```
+
+Callback приходит из Rust-треда. Все обновления StateFlow — через `viewModelScope.launch` (main dispatcher).
+
+---
+
+## 9. Milestones
+
+### Milestone 0 — JNI PoC (0.5–1 день)
+
+Цель: доказать, что Rust собирается под Android и вызывается из Kotlin.
+
+- [ ] cargo-ndk собирает `libmush_jni.so` для arm64-v8a.
+- [ ] APK собирается, устанавливается на реальное устройство (не эмулятор).
+- [ ] Одна кнопка → `Native.pubkey(handle)` → строка на экране.
+- [ ] Логи Rust видны в Logcat через tracing-android.
+
+**Если Milestone 0 не проходит — дальше не идти. Это blocker.**
+
+### Milestone 1 — JNI bridge полный (1 день)
+
+- [ ] Все `extern "C"` функции из §5.1 реализованы.
+- [ ] Callback Rust → Kotlin работает (тест: send to self, сообщение появляется в StateFlow).
+- [ ] Ошибки → RuntimeException в Kotlin.
+- [ ] `cargo test --release` для mush-jni проходит.
+
+### Milestone 2 — Transport (1–1.5 дня)
+
+- [ ] `WifiManager.startLocalOnlyHotspot` работает на тестовом устройстве.
+- [ ] Owner IP определяется через NetworkInterface.
+- [ ] TCP listener + connect между двумя телефонами.
+- [ ] LAN fallback: если hotspot падает — переключение без перезапуска.
+- [ ] Foreground service держит сеть >30 минут.
+- [ ] Проверка: два телефона в одной комнате пингуют друг друга.
+
+### Milestone 3 — Compose UI (1.5 дня)
+
+- [ ] 6 экранов рендерятся, навигация работает.
+- [ ] QR scan (ZXing) читает invite-строку.
+- [ ] QR show генерирует invite-строку.
+- [ ] Messages отображаются с статусами.
+- [ ] Alerts от S1/S7 появляются в UI.
+
+### Milestone 4 — Интеграция (1–1.5 дня)
+
+- [ ] End-to-end: 2 телефона, QR-контакт, /send, сообщение в чате.
+- [ ] Все 8 критериев из §10 проходят.
+- [ ] `cargo test` + `./gradlew test` зелёные.
+
+**Итого: 5–6 дней.** Не 3. JNI + hotspot + foreground service — три вещи, которые съедают больше, чем планируешь.
+
+---
+
+## 10. Критерии приёмки
+
+Из MUSH-A'-SPEC.md §8 — 8 критериев, здесь они переформулированы для Android:
+
+| # | Критерий | Как проверить |
+|---|----------|--------------|
+| 1 | Два телефона обмениваются сообщениями | Демо: 2 Android, hotspot, текст |
+| 2 | QR-контакт работает без интернета | Airplane mode, QR scan, handshake |
+| 3 | LAN fallback работает | Отключить hotspot permission → оба в одной Wi-Fi → сообщение доходит |
+| 4 | Групповой чат 4 человека синхронизируется | 4 телефона, сообщения видны всем после sync |
+| 5 | S1 детектирует аномалию | `/flood 50` в debug-меню → alert в UI |
+| 6 | S7 детектирует decoy hit | Debug: «отправить на decoy» → alert |
+| 7 | Backpressure работает | 100+ сообщений → oldest удаляются |
+| 8 | Нет крашей при 30 мин | Monkey test, foreground service жив |
+
+---
+
+## 11. Что НЕ входит
+
+| Компонент | Почему не в A' | Когда |
+|-----------|---------------|-------|
+| **Double Ratchet** | Session_key симметричный, достаточно | Этап A |
+| **Pre-keys** | Нет offline delivery | Этап A |
+| **BLE** | Android 12+ permissions + GATT MTU | Этап C |
+| **WiFi-Direct P2P** | Нестабильно на Android | Этап C |
+| **Onion + cover traffic** | Нет multi-hop в одной комнате | Этап C |
+| **Fruiting Gateway** | Нет persistent групп | Этап D |
+| **Immune plane** (FSM, кворум) | Только S1 + S7 alerts | Этап E |
+| **Vironet** | Нет эволюции в 2-телефонном демо | Этап E |
+| **Push-уведомления** | Только foreground notification | После A' |
+| **Invite-link** (deep link) | Только QR в A' | Этап B |
+| **Идентикон** | Простой цветной квадрат вместо | Этап B |
+| **Safety Number** | Только fingerprint в debug | Этап B |
+
+---
+
+## 12. Риски
 
 | Риск | Вероятность | Митигация |
-|---|---|---|
-| cargo-ndk/NDK-версия | высокая | NDK 26 LTS, пин в `rust-toolchain` + CI-android job (ubuntu, `assembleDebug` без эмулятора) |
-| JNI-краш по обработке ошибок | средняя | все panic границы → Result → Throwable; `catch_unwind` в каждом extern "C" |
-| Hotspot permissions на китайских прошивках | высокая | LAN-fallback (спека §5.1), UI-бейдж |
-| Эмулятор без WiFi hotspot | высокая | Фаза 2 проверяется на LAN-mode между двумя эмуляторами; hotspot — на физике |
-| `mush-core` bind 127.0.0.1 | — | меняем на 0.0.0.0 в nodeCreate по флагу (CLI не ломается) |
+|------|------------|-----------|
+| **JNI не собирается** | Средняя | Milestone 0 — раньше всего. Если не проходит — блокер. |
+| **Tokio блокирует main thread** | Средняя | `runtime().spawn()`, callbacks через StateFlow. Явно в §5.4. |
+| **Hotspot падает на кастомной прошивке** | Высокая | LAN fallback в §6.2. Протестировать до демо. |
+| **Foreground service убит Android** | Средняя | `START_STICKY` + `ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE`. |
+| **Permissions отклонены** | Средняя | Грациозный fallback: hotspot → LAN. Обоснование в UI. |
+| **NDK version mismatch** | Низкая | r26+, зафиксировать в README. |
+| **Compose UI не успевает** | Низкая | Только 6 экранов, без тем/анимаций. |
 
-## CI (добавить к существующему ci.yml)
+---
 
-Job `android-build` на ubuntu-latest: setup JDK 17, SDK 34, NDK 26, rust android targets; шаги: `cargo ndk build` (mush-jni) + `gradle assembleDebug`. Артефакт: APK. Эмуляторные тесты — вне CI (медленно), только ручной прогон фаз.
+## 13. Контракт с mush-core
+
+**`mush-core` не меняется.**
+
+API: `Identity`, `SnsHandshake`, `Framing`, `ChatStore`, `ContactRateSensor`, `DecoyEidSensor`, `InboxBuffer`, `TcpTransport`.
+
+`mush-jni` — тонкий слой: только `extern "C"` обёртки, Tokio runtime, callback bridge.
+
+Если для Android нужно менять `mush-core` — это признак, что JNI-слой протекает. Остановиться и пересмотреть.
+
+**Проверка:** если для Android нужно менять `mush-core` — это признак, что JNI-слой протекает. Остановиться и пересмотреть.
+
+---
+
+## 14. Следующий шаг после A' Android
+
+**Если A' проходит 8 критериев:**
+
+- **Этап A:** Double Ratchet, pre-keys, persistent 1-on-1.
+- **Этап B:** SQLCipher, Vault, идентикон, Safety Number.
+- **Этап C:** BLE, WiFi-Direct, MAC rotation, Onion.
+- **Этап D:** Fruiting Gateway, Group CRDT, SBP.
+- **Этап E:** Immune plane, Vironet, CUSUM, stress-test.
+
+**Если A' не проходит** (люди не сканируют QR, UX непонятен, hotspot не работает):
+
+- Переделать onboarding и transport.
+- Не добавлять сложности.
+- Не начинать этап A.
