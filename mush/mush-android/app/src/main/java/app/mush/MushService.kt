@@ -153,11 +153,18 @@ class MushService : Service() {
                 updateNotification("Hotspot $ip:$port")
             },
             onFailed = {
-                val lan = NetworkManager.lanIp()
-                if (lan != null) {
-                    Native.setAdvertisedAddr(handle, "$lan:$port")
-                    MushStore.update { it.copy(connection = ConnectionState.Lan(lan, port)) }
-                    updateNotification("LAN $lan:$port")
+                // AP может существовать, хотя резервация не взялась
+                // (vendor rate-limit) — тогда адvertисим ap0.
+                val ap = NetworkManager.findApIp(strict = true)
+                val reachable = ap ?: NetworkManager.lanIp()
+                if (reachable != null) {
+                    Native.setAdvertisedAddr(handle, "$reachable:$port")
+                    val invite = Native.invite(handle)
+                    val mode = if (ap != null) ConnectionState.Hotspot(ap, port) else ConnectionState.Lan(reachable, port)
+                    MushStore.update {
+                        it.copy(connection = mode, invite = invite, statusLine = "${if (ap != null) "Hotspot" else "LAN"} $reachable:$port")
+                    }
+                    updateNotification("${if (ap != null) "Hotspot" else "LAN"} $reachable:$port")
                 } else {
                     MushStore.update { it.copy(connection = ConnectionState.None) }
                     updateNotification("Node on port $port")
@@ -190,6 +197,8 @@ class MushService : Service() {
             is NodeCommand.DismissAlert -> MushStore.update { s ->
                 s.copy(alerts = s.alerts.filterNot { it.id == cmd.id })
             }
+            is NodeCommand.DebugFlood -> Native.flood(handle, cmd.n)
+            NodeCommand.DebugDecoy -> Native.decoy(handle)
         }
     }
 

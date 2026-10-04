@@ -55,6 +55,17 @@ fun QrShowSheet(invite: String, onDismiss: () -> Unit) {
                 invite.take(48) + "…",
                 style = MaterialTheme.typography.bodySmall,
             )
+            // Wi-Fi-креденшелы AP: клиент подключается к сети ДО скана.
+            // TODO(post-A'): перенести в Wi-Fi-QR / WifiNetworkSpecifier.
+            val creds = androidx.compose.runtime.remember {
+                app.mush.NetworkManager.hotspotCredentials()
+            }
+            if (creds != null) {
+                Text(
+                    "Wi-Fi: ${creds.first}\nПароль: ${creds.second}",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
             Button(onClick = onDismiss) { Text("Закрыть") }
         }
     }

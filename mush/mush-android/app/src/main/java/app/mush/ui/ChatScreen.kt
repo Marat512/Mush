@@ -101,5 +101,19 @@ fun ChatScreen(viewModel: MushViewModel, onBack: () -> Unit) {
                 Text("➤")
             }
         }
+        // Debug hooks (§10, критерии 6/7): ручной триггер S1/S7.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Button(onClick = { viewModel.send(NodeCommand.DebugFlood(50)) }) {
+                Text("DBG S1 flood×50")
+            }
+            Button(onClick = { viewModel.send(NodeCommand.DebugDecoy) }) {
+                Text("DBG S7 decoy")
+            }
+        }
     }
 }

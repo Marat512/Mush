@@ -27,5 +27,8 @@ object Native {
     external fun connect(handle: Long, host: String, port: Int): Boolean
     external fun send(handle: Long, groupId: String, text: String): Boolean
     external fun setAdvertisedAddr(handle: Long, addr: String)
+    // Debug hooks для §10 (критерии 6/7): триггер S1/S7 вручную.
+    external fun flood(handle: Long, n: Int): Boolean
+    external fun decoy(handle: Long): Boolean
     external fun shutdown(handle: Long)
 }

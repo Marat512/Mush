@@ -53,6 +53,9 @@ sealed interface NodeCommand {
     data class SendMessage(val text: String) : NodeCommand
     data class Join(val invite: String) : NodeCommand
     data class DismissAlert(val id: String) : NodeCommand
+    // Debug hooks (§10, критерии 6/7): триггерят S1/S7 вручную.
+    data class DebugFlood(val n: Int) : NodeCommand
+    data object DebugDecoy : NodeCommand
 }
 
 /** Хранилище состояния: пишет MushService (колбэк Rust), читает UI.

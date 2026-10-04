@@ -149,8 +149,33 @@ pub async unsafe fn node_join(handle: *mut JniNode, invite: &str) -> Result<bool
     Ok(true)
 }
 
-/// Override the address invites carry (hotspot/LAN interface IP). Empty
-/// string clears the override. Invites minted afterwards use it.
+/// Debug hook: burst of `n` messages to trigger S1 (A'-SPEC §10, criterion 6).
+pub async unsafe fn node_flood(handle: *mut JniNode, n: usize) -> Result<bool, String> {
+    let node = &mut *handle;
+    let arc = node.node.clone();
+    let sink = node.sink.clone();
+    runtime().spawn(async move {
+        if let Err(e) = arc.lock().await.flood("default", n).await {
+            sink.on_error(ERR_SEND, &e);
+        }
+    });
+    Ok(true)
+}
+
+/// Debug hook: send a bundle to a peer's decoy EID to trigger S7 (criterion 7).
+pub async unsafe fn node_decoy(handle: *mut JniNode) -> Result<bool, String> {
+    let node = &mut *handle;
+    let arc = node.node.clone();
+    let sink = node.sink.clone();
+    runtime().spawn(async move {
+        if let Err(e) = arc.lock().await.send_decoy().await {
+            sink.on_error(ERR_SEND, &e);
+        }
+    });
+    Ok(true)
+}
+
+/// Override the address invites carry (hotspot/LAN interface IP). Empty/// string clears the override. Invites minted afterwards use it.
 pub async unsafe fn node_set_advertised_addr(
     handle: *mut JniNode,
     addr: &str,

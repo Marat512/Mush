@@ -2,6 +2,7 @@ package app.mush
 
 import android.content.Context
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import app.mush.ui.MushStore
@@ -20,6 +21,21 @@ object NetworkManager {
 
     val hotspotActive: Boolean get() = reservation != null
 
+    /** SSID + пароль активного AP (клиенту нужны до скана invite-QR).
+     *  API 30+: SoftApConfiguration; 26–29: wifiConfiguration (deprecated). */
+    fun hotspotCredentials(): Pair<String, String>? {
+        val res = reservation ?: return null
+        return if (Build.VERSION.SDK_INT >= 30) {
+            val cfg = res.softApConfiguration
+            cfg.ssid.toString() to (cfg.passphrase ?: "")
+        } else {
+            @Suppress("DEPRECATION")
+            val cfg = res.wifiConfiguration ?: return null
+            val ssid = cfg.SSID?.removeSurrounding("\"") ?: return null
+            ssid to (cfg.preSharedKey ?: "")
+        }
+    }
+
     fun startHotspot(
         context: Context,
         onReady: (ip: String) -> Unit,
@@ -36,10 +52,15 @@ object NetworkManager {
             override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
                 reservation = res
                 // IP AP может появиться с задержкой (Huawei HicomNfManager
-                // сам ретраит ~15с) — поллим интерфейсы, не хардкодим.
+                // сам ретраит ~15с). Две фазы: сначала ищем ТОЛЬКО
+                // AP-интерфейс (ap0/swlan — HyperOS даёт ap0=10.51.89.x,
+                // а station-wlan0 с WAN-подсетью подходит префиксу 'wlan');
+                // если AP-iface не появился за 10с — берём любой подходящий.
                 Thread {
-                    val ip = (1..30).firstNotNullOfOrNull {
-                        findApIp() ?: run { Thread.sleep(500); null }
+                    val ip = (1..20).firstNotNullOfOrNull {
+                        findApIp(strict = true) ?: run { Thread.sleep(500); null }
+                    } ?: (1..10).firstNotNullOfOrNull {
+                        findApIp(strict = false) ?: run { Thread.sleep(500); null }
                     }
                     Handler(Looper.getMainLooper()).post {
                         if (ip != null) {
@@ -70,9 +91,15 @@ object NetworkManager {
         reservation = null
     }
 
-    /** IPv4 интерфейса точки доступа (или null, пока vendor-стек его не назначил). */
-    fun findApIp(): String? =
-        findIpv4 { name -> name.startsWith("wlan") || name.startsWith("ap") || name.startsWith("swlan") }
+    /** IPv4 интерфейса точки доступа.
+     *  strict=true: только AP-интерфейсы (ap0, swlan0; иначе на
+     *  STA+AP-чипах station-wlan0 с WAN-подсетью выигрывает гонку).
+     *  strict=false: + wlan0 fallback. */
+    fun findApIp(strict: Boolean): String? =
+        findIpv4 { name ->
+            name.startsWith("ap") || name.startsWith("swlan") ||
+                (!strict && name.startsWith("wlan"))
+        }
 
     /** LAN-адрес устройства (режим fallback: оба телефона в одной Wi-Fi сети). */
     fun lanIp(): String? = findIpv4 { name -> name.startsWith("wlan") || name.startsWith("eth") || name.startsWith("ccmni") }

@@ -22,8 +22,8 @@ use jni::JNIEnv;
 use callback::{EventSink, KotlinCallback};
 use errors::throw;
 use node::{
-    node_connect, node_init, node_invite, node_join, node_pubkey, node_send,
-    node_set_advertised_addr, node_shutdown, node_start_listener,
+    node_connect, node_decoy, node_flood, node_init, node_invite, node_join, node_pubkey,
+    node_send, node_set_advertised_addr, node_shutdown, node_start_listener,
 };
 use runtime::runtime;
 
@@ -286,6 +286,59 @@ pub extern "C" fn Java_app_mush_Native_setAdvertisedAddr(
         Ok(Ok(())) => {}
         Ok(Err(e)) => throw(&mut env, &e),
         Err(_) => throw(&mut env, "Rust panic in Native.setAdvertisedAddr"),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_flood(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    n: jint,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<jboolean, String> {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        Ok(runtime().block_on(unsafe {
+            node_flood(handle as *mut node::JniNode, n.max(0) as usize)
+        })? as jboolean)
+    }));
+    match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            throw(&mut env, &e);
+            0
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.flood");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_decoy(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<jboolean, String> {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        Ok(runtime().block_on(unsafe { node_decoy(handle as *mut node::JniNode) })? as jboolean)
+    }));
+    match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            throw(&mut env, &e);
+            0
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.decoy");
+            0
+        }
     }
 }
 

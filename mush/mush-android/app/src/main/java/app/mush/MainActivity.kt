@@ -37,6 +37,7 @@ import app.mush.ui.ChatScreen
 import app.mush.ui.ContactsScreen
 import app.mush.ui.MushViewModel
 import app.mush.ui.NodeCommand
+import app.mush.ui.NodePhase
 import app.mush.ui.OnboardingScreen
 import app.mush.ui.QrScanSheet
 import app.mush.ui.QrShowSheet
@@ -100,6 +101,12 @@ fun AppNav(
     var scanQr by rememberSaveable { mutableStateOf(false) }
     val viewModel: MushViewModel = viewModel()
 
+    // Автостарт ноды при входе в main-экраны: сервис не переживает
+    // force-stop/reinstall, иначе UI показывал бы "Node not started" вечно.
+    val autoStart: () -> Unit = {
+        if (viewModel.state.value.phase == NodePhase.Stopped) startService()
+    }
+
     NavHost(navController = nav, startDestination = "splash") {
         composable("splash") {
             SplashScreen(onTimeout = {
@@ -115,7 +122,7 @@ fun AppNav(
                 nav.navigate("chats") { popUpTo("onboarding") { inclusive = true } }
             })
         }
-        composable("chats") { MainScaffold(viewModel, nav, { showQr = true }, { scanQr = true }) }
+        composable("chats") { androidx.compose.runtime.LaunchedEffect(Unit) { autoStart() }; MainScaffold(viewModel, nav, { showQr = true }, { scanQr = true }) }
         composable("chat") {
             ChatScreen(viewModel, onBack = { nav.popBackStack() })
         }
