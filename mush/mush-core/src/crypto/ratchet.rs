@@ -115,6 +115,10 @@ pub struct PreKeyStore {
     pending: HashMap<u32, OneTimePreKey>,
     /// Опубликованные, ещё не использованные. Один ожидающий handshake.
     published: HashMap<u32, OneTimePreKey>,
+    /// Tombstone сожжённых OPK: id -> used_at. TTL USED_PREKEY_TTL_MS.
+    /// Ids монотонны (переиспользования нет) — множество чисто
+    /// детекционное: повторное использование = атака/ошибка (MUSH-A-SPEC §1).
+    used_pre_keys: std::collections::BTreeMap<u32, u64>,
     next_opk_id: u32,
 }
 
@@ -125,6 +129,7 @@ impl PreKeyStore {
             identity,
             pending: HashMap::new(),
             published: HashMap::new(),
+            used_pre_keys: std::collections::BTreeMap::new(),
             next_opk_id: 1,
         }
     }
@@ -188,7 +193,13 @@ impl PreKeyStore {
         let dh3 = dh_x_x(&self.spk.secret, &init.eph);
         let dh4 = match init.used_opk_id {
             Some(opk_id) => {
+                // Tombstone: повторное использование — атака/ошибка.
+                if self.used_pre_keys.contains_key(&opk_id) {
+                    return None;
+                }
                 let opk = self.published.remove(&opk_id)?;
+                self.used_pre_keys.insert(opk_id, now_millis());
+                self.prune_used_pre_keys();
                 dh_x_x(&opk.secret, &init.eph)
             }
             None => F_PADDING,
@@ -210,6 +221,12 @@ impl PreKeyStore {
     /// (DH(SPK, DHS_A) на первом сообщении).
     pub fn signed_pre_key_secret(&self) -> &StaticSecret {
         &self.spk.secret
+    }
+
+    /// TTL-prune tombstone used_pre_keys.
+    fn prune_used_pre_keys(&mut self) {
+        let cutoff = now_millis().saturating_sub(USED_PREKEY_TTL_MS);
+        self.used_pre_keys.retain(|_, used_at| *used_at > cutoff);
     }
 }
 
@@ -367,6 +384,21 @@ fn root_kdf(root_key: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 const MAX_SKIPPED: usize = 200;
 /// Максимальный разрыв индексов, который мы готовы догнать внутри цепи.
 const MAX_CHAIN_GAP: u32 = 100;
+/// TTL skipped keys: 7 суток (MUSH-A-SPEC §3).
+const SKIPPED_TTL_MS: u64 = 7 * 24 * 3600 * 1000;
+/// LRU-потолок seen_ratchet_keys (MUSH-A-SPEC §4).
+const SEEN_CAP: usize = 1000;
+/// TTL записей seen_ratchet_keys: 30 суток.
+const SEEN_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+/// TTL tombstone used_pre_keys: 30 суток (MUSH-A-SPEC §1).
+const USED_PREKEY_TTL_MS: u64 = 30 * 24 * 3600 * 1000;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Двусторонняя ratchet-сессия. Инициатор отправляет первым (после X3DH
 /// first message); респондер не может шифровать, пока не получит хотя бы
@@ -381,8 +413,9 @@ pub struct RatchetSession {
     recv_chain: Option<ChainKey>,
     /// Длина предыдущей нашей sending-цепочки (для pn в заголовке).
     prev_send_len: u32,
-    /// Пропущенные msg keys: (ratchet_key пира, индекс) -> msg key.
-    skipped: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
+    /// Пропущенные msg keys: (ratchet_key пира, индекс) -> (msg_key, created_at).
+    /// TTL — SKIPPED_TTL_MS, prune при export и lazily при decrypt (MUSH-A-SPEC §3).
+    skipped: std::collections::BTreeMap<([u8; 32], u32), ([u8; 32], u64)>,
     ad: [u8; 64],
     /// Responder-only: собственный SPK-секрет до обработки первого
     /// сообщения (recv-цепочка строится из DH(SPK, DHS_A)).
@@ -390,7 +423,8 @@ pub struct RatchetSession {
     /// Все ratchet-ключи пира, через которые мы уже прошли (текущий +
     /// прежние). Ключ вне этого набора — НОВЫЙ (ratchet-шаг); ключ из
     /// набора, но не текущий — старая цепочка, только skipped-lookup.
-    seen_ratchet_keys: std::collections::HashSet<[u8; 32]>,
+    /// LRU cap SEEN_CAP, TTL SEEN_TTL_MS.
+    seen_ratchet_keys: std::collections::HashMap<[u8; 32], u64>,
 }
 
 impl RatchetSession {
@@ -414,7 +448,7 @@ impl RatchetSession {
             skipped: std::collections::BTreeMap::new(),
             ad: start.ad,
             spk_secret: None,
-            seen_ratchet_keys: std::collections::HashSet::new(),
+            seen_ratchet_keys: std::collections::HashMap::new(),
         }
     }
 
@@ -433,7 +467,7 @@ impl RatchetSession {
             skipped: std::collections::BTreeMap::new(),
             ad: start.ad,
             spk_secret: Some(spk_secret),
-            seen_ratchet_keys: std::collections::HashSet::new(),
+            seen_ratchet_keys: std::collections::HashMap::new(),
         }
     }
 
@@ -478,17 +512,20 @@ impl RatchetSession {
             self.root_key = root;
             self.send_chain = Some(ChainKey { key: ck, index: 0 });
             self.dhr = Some(remote_key);
-            self.seen_ratchet_keys.insert(remote_key);
+            self.seen_ratchet_keys.insert(remote_key, now_millis());
             self.prev_send_len = 0;
         } else if self.dhr == Some(remote_key) {
             // Текущая цепочка — ничего не делаем.
-        } else if self.seen_ratchet_keys.contains(&remote_key) {
+            self.seen_ratchet_keys.insert(remote_key, now_millis());
+        } else if let Some(ts) = self.seen_ratchet_keys.get_mut(&remote_key) {
             // Старая цепочка: сообщение открывается ТОЛЬКО skipped-ключом.
-            let mk = self.skipped.remove(&(remote_key, n))?;
+            *ts = now_millis();
+            let (mk, _) = self.skipped.remove(&(remote_key, n))?;
             return aes_gcm_decrypt_aad(&mk, &msg.ciphertext, &msg.nonce, &self.ad);
         } else {
             // Новый ratchet-ключ пира: DH-ratchet шаг.
-            self.seen_ratchet_keys.insert(remote_key);
+            self.seen_ratchet_keys.insert(remote_key, now_millis());
+            self.evict_seen_if_needed();
             self.ratchet(remote_key, msg.header.prev_chain_len)?;
         }
 
@@ -496,7 +533,7 @@ impl RatchetSession {
 
         if n < chain.index {
             // Позднее сообщение: msg key из skipped, извлекается (одноразово).
-            let mk = self.skipped.remove(&(remote_key, n))?;
+            let (mk, _) = self.skipped.remove(&(remote_key, n))?;
             return aes_gcm_decrypt_aad(&mk, &msg.ciphertext, &msg.nonce, &self.ad);
         }
 
@@ -505,27 +542,19 @@ impl RatchetSession {
             return None;
         }
         // Догоняем цепочку до n; промежуточные msg keys уходят в skipped.
+        let now = now_millis();
         let mut mk = None;
         for _ in 0..=gap {
             let (next, key) = chain.step();
             mk = Some(key);
             *chain = next;
             if chain.index <= n {
-                self.skipped.insert((remote_key, chain.index - 1), key);
+                self.skipped
+                    .insert((remote_key, chain.index - 1), (key, now));
             }
         }
         self.skipped.remove(&(remote_key, n));
-        if self.skipped.len() > MAX_SKIPPED {
-            let evict: Vec<_> = self
-                .skipped
-                .keys()
-                .take(self.skipped.len() - MAX_SKIPPED)
-                .copied()
-                .collect();
-            for k in evict {
-                self.skipped.remove(&k);
-            }
-        }
+        self.evict_skipped_if_needed();
         aes_gcm_decrypt_aad(&mk?, &msg.ciphertext, &msg.nonce, &self.ad)
     }
 
@@ -538,9 +567,10 @@ impl RatchetSession {
     /// рассинхронизируется (парирующие DH: DH(our, their) == DH(their, our)).
     fn ratchet(&mut self, remote_key: [u8; 32], pn: u32) -> Option<()> {
         if let Some(chain) = self.recv_chain.as_mut() {
+            let now = now_millis();
             while chain.index < pn {
                 let (next, mk) = chain.step();
-                self.skipped.insert((self.dhr?, chain.index), mk);
+                self.skipped.insert((self.dhr?, chain.index), (mk, now));
                 *chain = next;
                 if self.skipped.len() > MAX_SKIPPED {
                     return None;
@@ -570,6 +600,112 @@ impl RatchetSession {
     /// Сколько msg keys сейчас в skipped (для тестов/диагностики).
     pub fn skipped_len(&self) -> usize {
         self.skipped.len()
+    }
+
+    /// Удаляет просроченные skipped keys.
+    fn prune_skipped(&mut self) {
+        let cutoff = now_millis().saturating_sub(SKIPPED_TTL_MS);
+        self.skipped.retain(|_, (_, created)| *created > cutoff);
+    }
+
+    /// Eviction skipped до MAX_SKIPPED (FIFO по ключу карты — BTreeMap
+    /// упорядочен, take() с начала отдаёт «старшие» индексы; для потолка
+    /// 200 это приемлемая аппроксимация LRU).
+    fn evict_skipped_if_needed(&mut self) {
+        while self.skipped.len() > MAX_SKIPPED {
+            let oldest = *self.skipped.keys().next().expect("non-empty");
+            self.skipped.remove(&oldest);
+        }
+    }
+
+    /// Eviction seen_ratchet_keys по LRU (last_seen) до SEEN_CAP.
+    fn evict_seen_if_needed(&mut self) {
+        while self.seen_ratchet_keys.len() > SEEN_CAP {
+            let oldest = self
+                .seen_ratchet_keys
+                .iter()
+                .min_by_key(|(_, ts)| *ts)
+                .map(|(k, _)| *k)
+                .expect("non-empty");
+            self.seen_ratchet_keys.remove(&oldest);
+        }
+    }
+}
+
+/// Пропущенный msg key: ((ratchet_key пира, индекс), (msg_key, created_at)).
+pub type SkippedEntry = (([u8; 32], u32), ([u8; 32], u64));
+/// Виденный ratchet-ключ пира: (ключ, last_seen).
+pub type SeenEntry = ([u8; 32], u64);
+
+/// Сериализуемое состояние сессии (MUSH-A-SPEC §3). Versioned:
+/// несовпадение version -> import None, не молчаливая потеря данных.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetSessionState {
+    pub version: u32,
+    pub root_key: [u8; 32],
+    pub dhs: [u8; 32],
+    pub dhr: Option<[u8; 32]>,
+    pub send_chain: Option<([u8; 32], u32)>,
+    pub recv_chain: Option<([u8; 32], u32)>,
+    pub prev_send_len: u32,
+    /// ((ratchet_key, index), (msg_key, created_at))
+    pub skipped: Vec<SkippedEntry>,
+    /// (ratchet_key, last_seen)
+    pub seen: Vec<SeenEntry>,
+    /// AD = IK_A‖IK_B — двумя полями: serde не умеет [u8; 64].
+    pub ad_a: [u8; 32],
+    pub ad_b: [u8; 32],
+}
+
+impl RatchetSession {
+    /// Экспорт состояния: TTL-prune skipped и seen перед записью.
+    /// Инвариант размера (< 8 KB) — в тестах.
+    pub fn export_state(&mut self) -> RatchetSessionState {
+        self.prune_skipped();
+        let now = now_millis();
+        let seen_cutoff = now.saturating_sub(SEEN_TTL_MS);
+        self.seen_ratchet_keys.retain(|_, ts| *ts > seen_cutoff);
+        self.evict_seen_if_needed();
+        RatchetSessionState {
+            version: 1,
+            root_key: self.root_key,
+            dhs: self.dhs.to_bytes(),
+            dhr: self.dhr,
+            send_chain: self.send_chain.map(|c| (c.key, c.index)),
+            recv_chain: self.recv_chain.map(|c| (c.key, c.index)),
+            prev_send_len: self.prev_send_len,
+            skipped: self.skipped.iter().map(|(k, v)| (*k, *v)).collect(),
+            seen: self
+                .seen_ratchet_keys
+                .iter()
+                .map(|(k, ts)| (*k, *ts))
+                .collect(),
+            ad_a: self.ad[..32].try_into().expect("ad first half"),
+            ad_b: self.ad[32..].try_into().expect("ad second half"),
+        }
+    }
+
+    /// Восстановление состояния. `spk_secret` не сериализуется (transient):
+    /// к моменту persist сессия уже обменялась сообщениями.
+    pub fn import_state(state: &RatchetSessionState) -> Option<Self> {
+        if state.version != 1 {
+            return None;
+        }
+        let mut ad = [0u8; 64];
+        ad[..32].copy_from_slice(&state.ad_a);
+        ad[32..].copy_from_slice(&state.ad_b);
+        Some(RatchetSession {
+            root_key: state.root_key,
+            dhs: StaticSecret::from(state.dhs),
+            dhr: state.dhr,
+            send_chain: state.send_chain.map(|(key, index)| ChainKey { key, index }),
+            recv_chain: state.recv_chain.map(|(key, index)| ChainKey { key, index }),
+            prev_send_len: state.prev_send_len,
+            skipped: state.skipped.iter().map(|(k, v)| (*k, *v)).collect(),
+            spk_secret: None,
+            seen_ratchet_keys: state.seen.iter().map(|(k, ts)| (*k, *ts)).collect(),
+            ad,
+        })
     }
 }
 
@@ -802,5 +938,161 @@ mod tests {
         // mk0 -> никакого шага не существует; next_ck известен только по chain key.
         assert_ne!(mk0, mk1);
         assert_ne!(mk0, next_ck.key);
+    }
+
+    // ---- Persistence (MUSH-A-SPEC §3) ----
+
+    #[test]
+    fn dr_export_import_continues_exchange() {
+        let (mut alice, mut bob) = dr_pair();
+        for i in 0..3 {
+            let m = alice.encrypt(format!("pre-{i}").as_bytes()).unwrap();
+            bob.decrypt(&m).unwrap();
+        }
+        let reply = bob.encrypt(b"reply").unwrap();
+        alice.decrypt(&reply).unwrap();
+
+        // Persist + restore Alice.
+        let state = alice.export_state();
+        let mut alice2 = RatchetSession::import_state(&state).expect("import");
+
+        // Bob (не тронут) понимает сообщения восстановленной Alice.
+        let after = alice2.encrypt(b"after-restore").unwrap();
+        assert_eq!(bob.decrypt(&after).unwrap(), b"after-restore");
+        // И обратно: восстановленная Alice понимает Bob'а (полный ratchet).
+        let b2 = bob.encrypt(b"bob-again").unwrap();
+        assert_eq!(alice2.decrypt(&b2).unwrap(), b"bob-again");
+        let a3 = alice2.encrypt(b"alice-final").unwrap();
+        assert_eq!(bob.decrypt(&a3).unwrap(), b"alice-final");
+    }
+
+    #[test]
+    fn dr_import_rejects_unknown_version() {
+        let (mut alice, _bob) = dr_pair();
+        alice.encrypt(b"x").unwrap();
+        let mut state = alice.export_state();
+        state.version = 2;
+        assert!(RatchetSession::import_state(&state).is_none());
+    }
+
+    #[test]
+    fn dr_export_prunes_expired_skipped() {
+        let (mut alice, mut bob) = dr_pair();
+        let m0 = alice.encrypt(b"m0").unwrap();
+        let _m1 = alice.encrypt(b"m1").unwrap();
+        let m2 = alice.encrypt(b"m2").unwrap();
+        bob.decrypt(&m0).unwrap();
+        bob.decrypt(&m2).unwrap(); // m1 -> skipped (gap)
+        assert!(bob.skipped_len() >= 1);
+        // Подстареваем одну запись (имитация старости).
+        let old = now_millis().saturating_sub(SKIPPED_TTL_MS + 1000);
+        let key = *bob.skipped.keys().next().expect("skipped non-empty");
+        bob.skipped.insert(key, ([9u8; 32], old));
+        let state = bob.export_state();
+        assert!(
+            state.skipped.iter().all(|(_, (_, ts))| *ts > old),
+            "просроченные skipped должны исчезнуть при export"
+        );
+    }
+
+    #[test]
+    fn dr_export_size_bounded_after_heavy_traffic() {
+        let (mut alice, mut bob) = dr_pair();
+        let mut pending = Vec::new();
+        for i in 0..300u32 {
+            let m = alice.encrypt(format!("msg-{i}").as_bytes()).unwrap();
+            if i % 3 == 0 {
+                // Каждое третье «теряется» до следующего ratchet -> skipped.
+                pending.push(m);
+            } else {
+                bob.decrypt(&m).unwrap();
+            }
+            if i % 50 == 49 {
+                // Регулярный ответ Bob'а — форсирует DH-ratchet шаги.
+                let r = bob.encrypt(b"tick").unwrap();
+                alice.decrypt(&r).unwrap();
+            }
+        }
+        for m in pending.iter().take(50) {
+            let _ = bob.decrypt(m); // часть может не дойти — неважно
+        }
+        let state = bob.export_state();
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&state, &mut cbor).expect("cbor");
+        assert!(
+            cbor.len() < 8192,
+            "serialized state {} bytes exceeds 8 KB invariant",
+            cbor.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod golden {
+    //! Golden vectors (MUSH-A-SPEC §2): пин KDF-примитивов. Любое изменение
+    //! domain-строк, их порядка или структуры KDF ломает этот тест — защита
+    //! от «зашитой» ошибки, которая молча протекла бы в persisted-сессии.
+    use super::*;
+    use crate::crypto::hkdf_derive;
+
+    fn unhex(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn golden_kdf_primitives() {
+        let ikm = [0x42u8; 32];
+        assert_eq!(
+            hkdf_derive(&ikm, b"mush-dr-ck", b""),
+            unhex("461e035256c7336fe571f7dea33c0271119883560f945c891f5c221a42a4ef89")
+        );
+        assert_eq!(
+            hkdf_derive(&ikm, b"mush-dr-mk", b""),
+            unhex("a82c7f766251ee4728da3e4be268116dac3cef0035967d1217d8c799d64643f8")
+        );
+        assert_eq!(
+            hkdf_derive(&ikm, b"mush-dr-root", b""),
+            unhex("6f31c3a0d3398d2448f587caac35cc445f9e76c55c4d2bd346e5b44330ce8765")
+        );
+        assert_eq!(
+            hkdf_derive(&ikm, b"mush-dr-chain", b""),
+            unhex("3107de13107cff441c377dbd155f45448119228c104ef394ea4a02d2257d1bd8")
+        );
+    }
+
+    #[test]
+    fn golden_x3dh_and_root_and_chain_step() {
+        let ad = associated_data(&[0x11u8; 32], &[0x22u8; 32]);
+        assert_eq!(
+            derive_sk(&ad, &[[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]),
+            unhex("3ff7e8e05efcf3e5eeec70a002addab29742f17c7bc0f806338f5c6034088395")
+        );
+        let (r, c) = root_kdf(&[0x42u8; 32], &[0x55u8; 32]);
+        assert_eq!(
+            r,
+            unhex("34f5bbb5f29173add257a992bed91cb8adc5bba47a0841269a9cab2ecb0d3140")
+        );
+        assert_eq!(
+            c,
+            unhex("17eba4930a9efd3f2fef8b52e2713ec17f3375f85b9f6a58572505882c2cd18e")
+        );
+        let chain = ChainKey {
+            key: [0x42u8; 32],
+            index: 0,
+        };
+        let (next, mk) = chain.step();
+        assert_eq!(
+            next.key,
+            unhex("461e035256c7336fe571f7dea33c0271119883560f945c891f5c221a42a4ef89")
+        );
+        assert_eq!(
+            mk,
+            unhex("a82c7f766251ee4728da3e4be268116dac3cef0035967d1217d8c799d64643f8")
+        );
+        assert_eq!(next.index, 1);
     }
 }
