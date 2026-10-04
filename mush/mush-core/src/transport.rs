@@ -125,6 +125,25 @@ pub struct SyncPayload {
     pub messages: Option<Vec<ChatMessage>>,
 }
 
+/// Core-level node events. Emitted over an optional sink so embedders (the JNI
+/// bridge) get push notifications instead of polling; the CLI leaves the sink
+/// unset. No JNI types here — plain data, protocol unchanged.
+#[derive(Debug, Clone)]
+pub enum NodeEvent {
+    /// A new chat message was accepted into a group's history (inbound path;
+    /// the sender's own echo is not an event).
+    Message {
+        group: GroupId,
+        sender: PubKey,
+        text: String,
+        lamport: u64,
+    },
+    /// A sensor alert surfaced to the user.
+    Alert(Alert),
+    /// Handshake with a peer completed (inbound or outbound).
+    HandshakeComplete { peer: PubKey, name: String },
+}
+
 /// Decoy frame payload (0x04).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecoyPayload {
@@ -150,6 +169,9 @@ pub struct Node {
     pub idle_flush: Duration,
     /// Handle to ourselves so outbound joins can spawn their read loop.
     self_ref: Option<Arc<Mutex<Node>>>,
+    /// Optional push-event sink (see `NodeEvent`). Set by embedders; the CLI
+    /// and tests leave it unset.
+    event_sink: Option<mpsc::UnboundedSender<NodeEvent>>,
 }
 
 impl Node {
@@ -173,6 +195,19 @@ impl Node {
             flush_every: Duration::from_millis(500),
             idle_flush: Duration::from_secs(1),
             self_ref: None,
+            event_sink: None,
+        }
+    }
+
+    /// Attach a push-event sink. Emission is fire-and-forget: if the receiver
+    /// is gone, events are dropped silently.
+    pub fn set_event_sink(&mut self, sink: mpsc::UnboundedSender<NodeEvent>) {
+        self.event_sink = Some(sink);
+    }
+
+    fn emit(&self, event: NodeEvent) {
+        if let Some(sink) = &self.event_sink {
+            let _ = sink.send(event);
         }
     }
 
@@ -267,6 +302,7 @@ impl Node {
 
     fn push_alert(&mut self, alert: Alert) {
         tracing::warn!("{}", alert.render());
+        self.emit(NodeEvent::Alert(alert.clone()));
         self.alerts.push((now_millis(), alert));
     }
 
@@ -298,6 +334,10 @@ impl Node {
                 group_id,
             },
         );
+        self.emit(NodeEvent::HandshakeComplete {
+            peer: session.peer_pubkey,
+            name: session.peer_name.clone(),
+        });
         tracing::info!(
             "Handshake complete with {} ({}). Session key established.",
             session.peer_name,
@@ -415,6 +455,12 @@ impl Node {
                     ),
                     None => return,
                 };
+                self.emit(NodeEvent::Message {
+                    group: group_id,
+                    sender: msg.sender,
+                    text: text.clone(),
+                    lamport: msg.timestamp,
+                });
                 println!("[{group_label}] {}: {text}", self.contact_name(&msg.sender));
                 self.inbox.push(IncomingMessage {
                     from: msg.sender,
