@@ -26,5 +26,6 @@ object Native {
     external fun startListener(handle: Long, port: Int): Int
     external fun connect(handle: Long, host: String, port: Int): Boolean
     external fun send(handle: Long, groupId: String, text: String): Boolean
+    external fun setAdvertisedAddr(handle: Long, addr: String)
     external fun shutdown(handle: Long)
 }

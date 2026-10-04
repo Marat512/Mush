@@ -63,13 +63,39 @@ class MushService : Service() {
             val h = Native.init(filesDir.absolutePath, callback)
             val pubkey = Native.pubkey(h)
             val port = Native.startListener(h, 0)
-            val invite = Native.invite(h)
             handle = h
-            NodeState.started(pubkey, port, invite)
-            updateNotification("Node on port $port")
+            NodeState.started(pubkey, port, Native.invite(h))
+            bringUpNetwork(port)
         } catch (t: Throwable) {
             NodeState.stopped("Error: ${t.message}")
         }
+    }
+
+    /** Hotspot — основной режим (§6.1); любая неудача → LAN fallback (§6.2).
+     *  После подъёма интерфейса invite перевыпускаем с реальным IP. */
+    private fun bringUpNetwork(port: Int) {
+        NetworkManager.startHotspot(
+            this,
+            onReady = { ip ->
+                Native.setAdvertisedAddr(handle, "$ip:$port")
+                val invite = Native.invite(handle)
+                NodeState.event("hotspot up: $ip:$port")
+                NodeState.event("invite: $invite")
+                NodeState.started(Native.pubkey(handle), port, invite)
+                updateNotification("Hotspot $ip:$port")
+            },
+            onFailed = {
+                val lan = NetworkManager.lanIp()
+                if (lan != null) {
+                    Native.setAdvertisedAddr(handle, "$lan:$port")
+                    NodeState.event("LAN mode: $lan:$port")
+                    updateNotification("LAN $lan:$port")
+                } else {
+                    NodeState.event("LAN mode: no interface IP")
+                    updateNotification("Node on port $port")
+                }
+            },
+        )
     }
 
     private fun createChannel() {
@@ -102,6 +128,7 @@ class MushService : Service() {
     }
 
     override fun onDestroy() {
+        NetworkManager.stopHotspot()
         if (handle != 0L) {
             runCatching { Native.shutdown(handle) }
             handle = 0

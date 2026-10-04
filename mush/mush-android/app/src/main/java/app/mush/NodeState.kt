@@ -26,11 +26,12 @@ object NodeState {
 
     fun started(pubkey: String, port: Int, invite: String) = update {
         it.copy(running = true, status = "Node started on port $port", pubkey = pubkey, port = port, invite = invite)
-    }
+    }.also { android.util.Log.d("mush-ui", "started port=$port") }
 
     fun stopped(reason: String) = update {
         it.copy(running = false, status = reason, port = 0)
-    }
+    }.also { android.util.Log.d("mush-ui", "stopped: $reason") }
 
     fun event(line: String) = update { it.copy(events = (it.events + line).takeLast(20)) }
+        .also { android.util.Log.d("mush-ui", "event: $line") }
 }

@@ -143,19 +143,20 @@ impl EventSink for KotlinCallback {
         );
     }
 
-    fn on_handshake_complete(&self, peer: &[u8; 32], name: &str) {
+    fn on_handshake_complete(&self, peer: &[u8; 32], _name: &str) {
+        // §5.2: onHandshakeComplete(peerPubkey) — один аргумент.
         let Ok(mut env) = self.vm.attach_current_thread() else {
             return;
         };
-        let (Ok(p), Ok(n)) = (env.new_string(base64::encode(peer)), env.new_string(name)) else {
+        let Ok(p) = env.new_string(base64::encode(peer)) else {
             return;
         };
-        let (p, n): (JObject, JObject) = (p.into(), n.into());
-        let args = [JValue::Object(&p), JValue::Object(&n)];
+        let p: JObject = p.into();
+        let args = [JValue::Object(&p)];
         let _ = env.call_method(
             &self.obj,
             "onHandshakeComplete",
-            "(Ljava/lang/String;Ljava/lang/String;)V",
+            "(Ljava/lang/String;)V",
             &args,
         );
     }

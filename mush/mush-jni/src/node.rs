@@ -149,6 +149,22 @@ pub async unsafe fn node_join(handle: *mut JniNode, invite: &str) -> Result<bool
     Ok(true)
 }
 
+/// Override the address invites carry (hotspot/LAN interface IP). Empty
+/// string clears the override. Invites minted afterwards use it.
+pub async unsafe fn node_set_advertised_addr(
+    handle: *mut JniNode,
+    addr: &str,
+) -> Result<(), String> {
+    let node = &*handle;
+    let addr = if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
+    };
+    node.node.lock().await.set_advertised_addr(addr);
+    Ok(())
+}
+
 /// TCP reachability probe (used by the UI to check a LAN address before join).
 /// Synchronous on purpose: callers run it off the main thread.
 pub unsafe fn node_connect(handle: *mut JniNode, host: &str, port: u16) -> Result<bool, String> {

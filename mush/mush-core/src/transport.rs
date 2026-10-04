@@ -156,6 +156,10 @@ pub struct Node {
     name: String,
     configured_port: u16,
     bound_addr: Option<String>,
+    /// Address override for invites: the IP a peer should dial. Embedders set
+    /// this when the listener binds 0.0.0.0 but the reachable address is a
+    /// specific interface (Android hotspot/LAN). CLI leaves it unset.
+    advertised_addr: Option<String>,
     pub contacts: HashMap<PubKey, Contact>,
     pub groups: HashMap<GroupId, AdHocGroup>,
     pub inbox: InboxBuffer,
@@ -183,6 +187,7 @@ impl Node {
             name: name.to_string(),
             configured_port: port,
             bound_addr: None,
+            advertised_addr: None,
             contacts: HashMap::new(),
             groups: HashMap::new(),
             inbox: InboxBuffer::new(),
@@ -224,16 +229,23 @@ impl Node {
         self.bound_addr = Some(addr.to_string());
     }
 
+    /// Override the address invites carry (reachable interface IP). `None`
+    /// restores the default (bound addr, or 127.0.0.1 fallback).
+    pub fn set_advertised_addr(&mut self, addr: Option<String>) {
+        self.advertised_addr = addr;
+    }
+
     /// Mint a fresh one-time invite (new nonce, TTL 24h). Creates the node's
     /// default group lazily on first use (creator flow).
     pub fn invite_now(&mut self) -> String {
         let mut nonce = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         self.issued_nonces.insert(nonce, Instant::now());
-        let addr = self
-            .bound_addr
-            .clone()
-            .unwrap_or_else(|| format!("127.0.0.1:{}", self.configured_port));
+        let addr = self.advertised_addr.clone().unwrap_or_else(|| {
+            self.bound_addr
+                .clone()
+                .unwrap_or_else(|| format!("127.0.0.1:{}", self.configured_port))
+        });
         let group_id = self.ensure_default_group();
         let group = &self.groups[&group_id];
         Invite {
@@ -1020,6 +1032,22 @@ mod tests {
             invite.group_id,
             node.default_group_id().expect("group created by invite")
         );
+    }
+
+    #[tokio::test]
+    async fn invite_uses_advertised_addr_override() {
+        let mut node = Node::new("alice", 7878);
+        node.set_bound("127.0.0.1:7878".parse().unwrap());
+        let s = node.invite_now();
+        assert!(s.contains("addr=127.0.0.1:7878"));
+
+        node.set_advertised_addr(Some("192.168.43.1:7878".to_string()));
+        let s = node.invite_now();
+        assert!(s.contains("addr=192.168.43.1:7878"));
+
+        node.set_advertised_addr(None);
+        let s = node.invite_now();
+        assert!(s.contains("addr=127.0.0.1:7878"));
     }
 
     #[tokio::test]
