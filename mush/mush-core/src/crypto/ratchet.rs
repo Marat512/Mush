@@ -205,6 +205,12 @@ impl PreKeyStore {
     pub fn signed_pre_key_id(&self) -> u32 {
         self.spk.key_id
     }
+
+    /// Секрет SPK для построения responder-стороны ratchet-сессии
+    /// (DH(SPK, DHS_A) на первом сообщении).
+    pub fn signed_pre_key_secret(&self) -> &StaticSecret {
+        &self.spk.secret
+    }
 }
 
 /// Первый фрейм сессии: initiator → responder. Передаётся открыто (ephemeral
@@ -305,6 +311,265 @@ impl X3dhInitiator {
             },
         )
             .into()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Double Ratchet поверх SessionStart (Signal DR).
+// ---------------------------------------------------------------------------
+
+/// Заголовок ratchet-сообщения (открытая часть).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetHeader {
+    /// Текущий DH-ratchet публичный ключ отправителя.
+    pub ratchet_key: [u8; 32],
+    /// Индекс msg key этого сообщения в его цепочке (n).
+    pub chain_index: u32,
+    /// Длина предыдущей sending-цепочки отправителя (pn) — для skipped keys.
+    pub prev_chain_len: u32,
+}
+
+/// Шифрованное ratchet-сообщение (wire-форма).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetMessage {
+    pub header: RatchetHeader,
+    pub nonce: [u8; 12],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Chain key: секрет цепочки + сколько msg keys уже извлечено.
+#[derive(Debug, Clone, Copy)]
+struct ChainKey {
+    key: [u8; 32],
+    index: u32,
+}
+
+impl ChainKey {
+    /// Единственный шаг цепочки: следующий chain key + msg key для текущего index.
+    fn step(&self) -> (ChainKey, [u8; 32]) {
+        let next = ChainKey {
+            key: hkdf_derive(&self.key, b"mush-dr-ck", b""),
+            index: self.index + 1,
+        };
+        let mk = hkdf_derive(&self.key, b"mush-dr-mk", b"");
+        (next, mk)
+    }
+}
+
+/// KDF корневой цепи на DH-шаге: новый root key + новый chain key.
+fn root_kdf(root_key: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let next_root = hkdf_derive(dh_out, root_key, b"mush-dr-root");
+    let chain = hkdf_derive(dh_out, root_key, b"mush-dr-chain");
+    (next_root, chain)
+}
+
+/// Потолок skipped keys (защита от DoS переполнением).
+const MAX_SKIPPED: usize = 200;
+/// Максимальный разрыв индексов, который мы готовы догнать внутри цепи.
+const MAX_CHAIN_GAP: u32 = 100;
+
+/// Двусторонняя ratchet-сессия. Инициатор отправляет первым (после X3DH
+/// first message); респондер не может шифровать, пока не получит хотя бы
+/// одно сообщение (нет remote ratchet key).
+pub struct RatchetSession {
+    root_key: [u8; 32],
+    /// Наш текущий DH-ratchet секрет. Заменяется на свежий при каждом
+    /// получении НОВОГО ratchet-ключа пира.
+    dhs: StaticSecret,
+    dhr: Option<[u8; 32]>,
+    send_chain: Option<ChainKey>,
+    recv_chain: Option<ChainKey>,
+    /// Длина предыдущей нашей sending-цепочки (для pn в заголовке).
+    prev_send_len: u32,
+    /// Пропущенные msg keys: (ratchet_key пира, индекс) -> msg key.
+    skipped: std::collections::BTreeMap<([u8; 32], u32), [u8; 32]>,
+    ad: [u8; 64],
+    /// Responder-only: собственный SPK-секрет до обработки первого
+    /// сообщения (recv-цепочка строится из DH(SPK, DHS_A)).
+    spk_secret: Option<StaticSecret>,
+    /// Все ratchet-ключи пира, через которые мы уже прошли (текущий +
+    /// прежние). Ключ вне этого набора — НОВЫЙ (ratchet-шаг); ключ из
+    /// набора, но не текущий — старая цепочка, только skipped-lookup.
+    seen_ratchet_keys: std::collections::HashSet<[u8; 32]>,
+}
+
+impl RatchetSession {
+    /// Initiator (Alice). Начальная send-цепочка строится из
+    /// DH(DHS_A, SPK_B) — тот же DH считает responder на первом сообщении,
+    /// получая recv-цепочку. `spk_public` — signed pre-key пира из бандла.
+    pub fn new_initiator(start: &SessionStart, spk_public: &[u8; 32]) -> Self {
+        let dhs = x25519_secret();
+        let dh0 = dh_x_x(&dhs, spk_public);
+        let (root, send_ck) = root_kdf(&start.sk, &dh0);
+        RatchetSession {
+            root_key: root,
+            dhs,
+            dhr: Some(*spk_public),
+            send_chain: Some(ChainKey {
+                key: send_ck,
+                index: 0,
+            }),
+            recv_chain: None,
+            prev_send_len: 0,
+            skipped: std::collections::BTreeMap::new(),
+            ad: start.ad,
+            spk_secret: None,
+            seen_ratchet_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Responder (Bob). До первого сообщения цепочек нет: recv-цепочка
+    /// появится из DH(SPK_B, DHS_A) (ключ DHS_A приезжает в первом
+    /// заголовке), send — из DH(DHS_B, DHS_A). `spk_secret` — собственный
+    /// signed pre-key, которым шифровался бандл.
+    pub fn new_responder(start: &SessionStart, spk_secret: StaticSecret) -> Self {
+        RatchetSession {
+            root_key: start.sk,
+            dhs: x25519_secret(),
+            dhr: None,
+            send_chain: None,
+            recv_chain: None,
+            prev_send_len: 0,
+            skipped: std::collections::BTreeMap::new(),
+            ad: start.ad,
+            spk_secret: Some(spk_secret),
+            seen_ratchet_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Шифрует сообщение. Респондер до обработки первого сообщения вернёт None.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Option<RatchetMessage> {
+        let chain = self.send_chain.as_mut()?;
+        let ratchet_key = x25519_public(&self.dhs);
+        let (next, mk) = chain.step();
+        let used_index = chain.index;
+        *chain = next;
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = aes_gcm_encrypt_aad(&mk, plaintext, &nonce, &self.ad);
+        Some(RatchetMessage {
+            header: RatchetHeader {
+                ratchet_key,
+                chain_index: used_index,
+                prev_chain_len: self.prev_send_len,
+            },
+            nonce,
+            ciphertext,
+        })
+    }
+
+    /// Дешифрует сообщение с поддержкой out-of-order (skipped keys).
+    /// None при невалидном ключе, израсходованном индексе (replay) или
+    /// слишком большом разрыве (DoS-страж).
+    pub fn decrypt(&mut self, msg: &RatchetMessage) -> Option<Vec<u8>> {
+        let remote_key = msg.header.ratchet_key;
+        let n = msg.header.chain_index;
+
+        // Первое сообщение responder'а: инициализация из SPK.
+        if let Some(spk) = self.spk_secret.take() {
+            let dh_recv = dh_x_x(&spk, &remote_key);
+            let (root, ck) = root_kdf(&self.root_key, &dh_recv);
+            self.root_key = root;
+            self.recv_chain = Some(ChainKey { key: ck, index: 0 });
+            // Send-цепочка: DH(текущий dhs, ключ первого сообщения) — парирует
+            // recv-цепочку initiator'а на его следующем шаге.
+            let dh_send = dh_x_x(&self.dhs, &remote_key);
+            let (root, ck) = root_kdf(&self.root_key, &dh_send);
+            self.root_key = root;
+            self.send_chain = Some(ChainKey { key: ck, index: 0 });
+            self.dhr = Some(remote_key);
+            self.seen_ratchet_keys.insert(remote_key);
+            self.prev_send_len = 0;
+        } else if self.dhr == Some(remote_key) {
+            // Текущая цепочка — ничего не делаем.
+        } else if self.seen_ratchet_keys.contains(&remote_key) {
+            // Старая цепочка: сообщение открывается ТОЛЬКО skipped-ключом.
+            let mk = self.skipped.remove(&(remote_key, n))?;
+            return aes_gcm_decrypt_aad(&mk, &msg.ciphertext, &msg.nonce, &self.ad);
+        } else {
+            // Новый ratchet-ключ пира: DH-ratchet шаг.
+            self.seen_ratchet_keys.insert(remote_key);
+            self.ratchet(remote_key, msg.header.prev_chain_len)?;
+        }
+
+        let chain = self.recv_chain.as_mut()?;
+
+        if n < chain.index {
+            // Позднее сообщение: msg key из skipped, извлекается (одноразово).
+            let mk = self.skipped.remove(&(remote_key, n))?;
+            return aes_gcm_decrypt_aad(&mk, &msg.ciphertext, &msg.nonce, &self.ad);
+        }
+
+        let gap = n - chain.index;
+        if gap > MAX_CHAIN_GAP {
+            return None;
+        }
+        // Догоняем цепочку до n; промежуточные msg keys уходят в skipped.
+        let mut mk = None;
+        for _ in 0..=gap {
+            let (next, key) = chain.step();
+            mk = Some(key);
+            *chain = next;
+            if chain.index <= n {
+                self.skipped.insert((remote_key, chain.index - 1), key);
+            }
+        }
+        self.skipped.remove(&(remote_key, n));
+        if self.skipped.len() > MAX_SKIPPED {
+            let evict: Vec<_> = self
+                .skipped
+                .keys()
+                .take(self.skipped.len() - MAX_SKIPPED)
+                .copied()
+                .collect();
+            for k in evict {
+                self.skipped.remove(&k);
+            }
+        }
+        aes_gcm_decrypt_aad(&mk?, &msg.ciphertext, &msg.nonce, &self.ad)
+    }
+
+    /// DH-ratchet шаг (первое сообщение уже обработано):
+    /// 1) остаток recv-цепочки до pn -> skipped (индекс по СТАРОМУ dhr);
+    /// 2) recv <- KDF(DH(текущий dhs, R));
+    /// 3) свежий dhs; send <- KDF(DH(свежий dhs, R)); pn <- длина старой send.
+    ///
+    /// Обе стороны выполняют KDF в одном глобальном порядке, root не
+    /// рассинхронизируется (парирующие DH: DH(our, their) == DH(their, our)).
+    fn ratchet(&mut self, remote_key: [u8; 32], pn: u32) -> Option<()> {
+        if let Some(chain) = self.recv_chain.as_mut() {
+            while chain.index < pn {
+                let (next, mk) = chain.step();
+                self.skipped.insert((self.dhr?, chain.index), mk);
+                *chain = next;
+                if self.skipped.len() > MAX_SKIPPED {
+                    return None;
+                }
+            }
+        }
+        let dh_recv = dh_x_x(&self.dhs, &remote_key);
+        let (root, ck) = root_kdf(&self.root_key, &dh_recv);
+        self.root_key = root;
+        self.recv_chain = Some(ChainKey { key: ck, index: 0 });
+
+        let old_send_len = self.send_chain.map(|c| c.index).unwrap_or(0);
+        let new_dhs = x25519_secret();
+        let dh_send = dh_x_x(&new_dhs, &remote_key);
+        let (root, send_ck) = root_kdf(&self.root_key, &dh_send);
+        self.root_key = root;
+        self.dhs = new_dhs;
+        self.send_chain = Some(ChainKey {
+            key: send_ck,
+            index: 0,
+        });
+        self.dhr = Some(remote_key);
+        self.prev_send_len = old_send_len;
+        Some(())
+    }
+
+    /// Сколько msg keys сейчас в skipped (для тестов/диагностики).
+    pub fn skipped_len(&self) -> usize {
+        self.skipped.len()
     }
 }
 
@@ -409,5 +674,133 @@ mod tests {
         assert!(empty_bundle.opk.is_none());
         bob.replenish(1);
         assert!(bob.publish_bundle().opk.is_some());
+    }
+
+    // ---- Double Ratchet ----
+
+    /// Пара ratchet-сессий через настоящий X3DH.
+    fn dr_pair() -> (RatchetSession, RatchetSession) {
+        let (mut bob_store, _bob_id) = setup();
+        let alice_id = Identity::generate();
+        let bundle = bob_store.publish_bundle();
+        let spk_public = bundle.spk;
+        let (start, init) = X3dhInitiator::start(&alice_id, &bundle, b"hi").expect("x3dh");
+        let (bob_start, _first) = bob_store.complete_handshake(&init).expect("x3dh resp");
+        let bob_spk = bob_store.signed_pre_key_secret().clone();
+        (
+            RatchetSession::new_initiator(&start, &spk_public),
+            RatchetSession::new_responder(&bob_start, bob_spk),
+        )
+    }
+
+    #[test]
+    fn dr_full_ping_pong_across_dh_ratchet() {
+        let (mut alice, mut bob) = dr_pair();
+
+        // Alice -> Bob: три сообщения по SK-цепочке.
+        let msgs: Vec<_> = (0..3)
+            .map(|i| alice.encrypt(format!("a{i}").as_bytes()).unwrap())
+            .collect();
+        for (i, m) in msgs.iter().enumerate() {
+            assert_eq!(bob.decrypt(m).unwrap(), format!("a{i}").into_bytes());
+        }
+
+        // Bob -> Alice: ответ (первый ratchet-шаг Bob'а).
+        let replies: Vec<_> = (0..2)
+            .map(|i| bob.encrypt(format!("b{i}").as_bytes()).unwrap())
+            .collect();
+        for (i, m) in replies.iter().enumerate() {
+            assert_eq!(alice.decrypt(m).unwrap(), format!("b{i}").into_bytes());
+        }
+
+        // Alice -> Bob: новая цепочка после её ratchet-шага.
+        let more: Vec<_> = (0..2)
+            .map(|i| alice.encrypt(format!("a2-{i}").as_bytes()).unwrap())
+            .collect();
+        for (i, m) in more.iter().enumerate() {
+            assert_eq!(bob.decrypt(m).unwrap(), format!("a2-{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn dr_responder_cannot_encrypt_before_first_message() {
+        let (mut _alice, mut bob) = dr_pair();
+        assert!(bob.encrypt(b"nope").is_none());
+    }
+
+    #[test]
+    fn dr_out_of_order_within_chain() {
+        let (mut alice, mut bob) = dr_pair();
+        let msgs: Vec<_> = (0..4)
+            .map(|i| alice.encrypt(format!("m{i}").as_bytes()).unwrap())
+            .collect();
+        assert_eq!(bob.decrypt(&msgs[0]).unwrap(), b"m0");
+        assert_eq!(bob.decrypt(&msgs[2]).unwrap(), b"m2");
+        assert!(bob.skipped_len() >= 1, "ключ m1 должен лежать в skipped");
+        assert_eq!(bob.decrypt(&msgs[1]).unwrap(), b"m1");
+        assert_eq!(bob.decrypt(&msgs[3]).unwrap(), b"m3");
+    }
+
+    #[test]
+    fn dr_out_of_order_across_ratchet() {
+        let (mut alice, mut bob) = dr_pair();
+        // Alice шлёт a0, a1 по SK-цепочке; Bob видит только a0,
+        // отвечает b0; Alice получает b0 и шлёт a2 УЖЕ по новой цепочке.
+        let a0 = alice.encrypt(b"a0").unwrap();
+        let a1 = alice.encrypt(b"a1").unwrap();
+        assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+        let b0 = bob.encrypt(b"b0").unwrap();
+        assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+        let a2 = alice.encrypt(b"a2").unwrap();
+
+        // Bob первым получает a2 (новый ratchet, pn=2 должен спрятать a1),
+        // потом доезжает опоздавшее a1.
+        assert_eq!(bob.decrypt(&a2).unwrap(), b"a2");
+        assert_eq!(bob.decrypt(&a1).unwrap(), b"a1");
+    }
+
+    #[test]
+    fn dr_replay_rejected() {
+        let (mut alice, mut bob) = dr_pair();
+        let m0 = alice.encrypt(b"once").unwrap();
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"once");
+        // Повтор того же сообщения: индекс уже пройден, skipped ключ
+        // извлечён — дешифровки не будет.
+        assert!(bob.decrypt(&m0).is_none());
+    }
+
+    #[test]
+    fn dr_distinct_ciphertexts_and_gap_guard() {
+        let (mut alice, mut bob) = dr_pair();
+        let c0 = alice.encrypt(b"same").unwrap();
+        let c1 = alice.encrypt(b"same").unwrap();
+        assert_ne!(c0.ciphertext, c1.ciphertext);
+
+        // Подделанный заголовок с недостижимым индексом — отказ.
+        let mut far = c0.clone();
+        far.header.chain_index = c1.header.chain_index + MAX_CHAIN_GAP + 1;
+        assert!(bob.decrypt(&far).is_none());
+    }
+
+    #[test]
+    fn dr_message_keys_forward_secret_within_chain() {
+        let (mut alice, mut bob) = dr_pair();
+        let m0 = alice.encrypt(b"secret-0").unwrap();
+        let m1 = alice.encrypt(b"secret-1").unwrap();
+        // Перехват m0 и его ключа не помогает: m1 шифруется другим msg key,
+        // следующий msg key из перехваченного не выводится (HKDF-separation
+        // ck/mk — mk не является входом следующего шага).
+        assert_eq!(bob.decrypt(&m0).unwrap(), b"secret-0");
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"secret-1");
+        // Структурная проверка: mk не порождает следующий mk.
+        let chain = ChainKey {
+            key: [7u8; 32],
+            index: 0,
+        };
+        let (next_ck, mk0) = chain.step();
+        let (_next2, mk1) = next_ck.step();
+        // mk0 -> никакого шага не существует; next_ck известен только по chain key.
+        assert_ne!(mk0, mk1);
+        assert_ne!(mk0, next_ck.key);
     }
 }
