@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod identity;
+pub mod sns;
 
 /// Standard base64 alphabet (RFC 4648) with padding. Implemented locally to
 /// keep the dependency footprint matching MUSH-A'-CLI-SPEC.
