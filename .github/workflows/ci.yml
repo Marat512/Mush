@@ -59,6 +59,6 @@ jobs:
         working-directory: mush
         run: cargo build --release --bin mush-node
 
-      - name: Smoke: two nodes exchange a message
+      - name: "Smoke: two nodes exchange a message"
         working-directory: mush
         run: bash scripts/smoke.sh
