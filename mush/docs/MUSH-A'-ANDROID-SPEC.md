@@ -1,7 +1,7 @@
 # MUSH-A'-ANDROID-SPEC — Android прототип (этап A')
 
-**Версия:** 0.1.0  
-**Дата:** 2026-09-29  
+**Версия:** 0.1.1  
+**Дата:** 2026-09-30  
 **Статус:** Draft — спецификация Android-прототипа  
 **База:** MUSH-A'-SPEC.md v0.1.1  
 **Предшественник:** MUSH-A'-CLI-SPEC.md v0.1.0 (Rust CLI, проверка логики ядра)  
@@ -163,6 +163,24 @@ dependencies {
 
 ## 5. JNI-контракт
 
+### 5.0. Формат invite — единый источник истины
+
+**QR несёт полную invite-строку** — результат `Invite::render` из `mush-core::transport`:
+
+```
+mush://<b64 pubkey>&nonce=<b64>&addr=host:port&group=<b64 group_id>-<b64 group_key>
+```
+
+Одна строка содержит всё, что нужно принимающей стороне: pubkey владельца, nonce рукопожатия, адрес для TCP-подключения и credentials группы. Принимающая сторона передаёт её в `join` (а JNI-слой — в `Node::join_peer`) **целиком, без сборки/парсинга на JNI-слое**. Один формат для hotspot-режима и для LAN fallback — разница только в том, какой IP попал в `addr` (hotspot-интерфейс vs LAN-интерфейс).
+
+**Fingerprint / identity display** — отдельный формат, НЕ для join:
+
+```
+mush://<pubkey>#<nonce>
+```
+
+Используется только для отображения («вот мой ключ для сверки») и позже в Safety Number (этап B). В QR не кодируется.
+
 ### 5.1. Rust-side: extern "C" функции
 
 ```rust
@@ -188,7 +206,7 @@ pub extern "system" fn Java_app_mush_Native_pubkey(
 pub extern "system" fn Java_app_mush_Native_invite(
     mut env: JNIEnv, _class: JClass,
     handle: jlong,
-) -> jstring;                // "mush://<pubkey>#<nonce>"
+) -> jstring;                // полная invite-строка (Invite::render), см. §5.0
 
 #[no_mangle]
 pub extern "system" fn Java_app_mush_Native_join(
@@ -282,6 +300,10 @@ impl KotlinCallback {
 
 **Правило:** `attach_current_thread` на каждом callback. Не пытаться держать `JNIEnv` между вызовами — Android-потоки приходят и уходят.
 
+**Bounded channel (обязательно):** события из Rust в Kotlin идут через канал с фиксированной ёмкостью. Если Kotlin не успевает обрабатывать — дропаются самые старые события, а не копятся бесконечно. Иначе event storm (S1 сработает 100 раз за секунду) положит heap.
+
+**GlobalRef lifecycle (обязательно):** `delete_global_ref` в `shutdown`/`nodeDestroy`. Не держать ссылки на Activity — только на callback-объект, принадлежащий Service (жизненный цикл ≥ жизненного цикла ноды).
+
 ### 5.4. Tokio runtime
 
 ```rust
@@ -348,8 +370,8 @@ IP не хардкодить. Получить через NetworkInterface API �
 Если hotspot не поднялся (permissions, кастомная прошивка, ошибка API):
 
 - Оба телефона в одной Wi-Fi сети.
-- Owner показывает QR с `{ group_id, group_key, ip, port }`.
-- Client сканирует → подключается по TCP.
+- Owner показывает QR с той же полной invite-строкой (§5.0) — только `addr` содержит LAN-IP вместо hotspot-IP.
+- Client сканирует → `join` → подключается по TCP.
 - Тот же протокол, тот же framing. Только IP не из hotspot-интерфейса, а из LAN-интерфейса.
 
 ### 6.3. Foreground service
@@ -446,12 +468,22 @@ Callback приходит из Rust-треда. Все обновления Stat
 
 Цель: доказать, что Rust собирается под Android и вызывается из Kotlin.
 
+Разделён на два гейта — это две разные проверки:
+
+**MS0-internal (закрывается первым):**
+
 - [ ] cargo-ndk собирает `libmush_jni.so` для arm64-v8a.
-- [ ] APK собирается, устанавливается на реальное устройство (не эмулятор).
+- [ ] APK собирается и запускается (эмулятор допустим).
 - [ ] Одна кнопка → `Native.pubkey(handle)` → строка на экране.
 - [ ] Логи Rust видны в Logcat через tracing-android.
 
-**Если Milestone 0 не проходит — дальше не идти. Это blocker.**
+Этот гейт доказывает главное: JNI работает в ART, `libmush_jni.so` загружается, `extern "C"` вызывается из Kotlin. Если MS0-internal не проходит — дальше не идти. Это blocker.
+
+**MS0-hardware (обязателен перед Milestone 2):**
+
+- [ ] APK устанавливается и запускается на реальном устройстве.
+
+Эмулятор не покажет поведение hotspot API (SecurityException на кастомных прошивках, нестандартные IP-диапазоны Xiaomi/Huawei), runtime permissions и LAN-интерфейсы. Начинать Milestone 2 (Transport) без реального устройства нельзя — всё встанет на первом же тесте транспорта.
 
 ### Milestone 1 — JNI bridge полный (1 день)
 
