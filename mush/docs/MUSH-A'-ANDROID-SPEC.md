@@ -1,6 +1,6 @@
 # MUSH-A'-ANDROID-SPEC — Android прототип (этап A')
 
-**Версия:** 0.1.1  
+**Версия:** 0.1.2  
 **Дата:** 2026-09-30  
 **Статус:** Draft — спецификация Android-прототипа  
 **База:** MUSH-A'-SPEC.md v0.1.1  
@@ -571,15 +571,13 @@ Callback приходит из Rust-треда. Все обновления Stat
 
 ## 13. Контракт с mush-core
 
-**`mush-core` не меняется.**
+**`mush-core` не знает про JNI-типы.**
 
-API: `Identity`, `SnsHandshake`, `Framing`, `ChatStore`, `ContactRateSensor`, `DecoyEidSensor`, `InboxBuffer`, `TcpTransport`.
+API: `Identity`, `HandshakeInitiator`/`HandshakeResponder`, `Frame`/`framing`, `AdHocGroup`, `ContactRateSensor`, `DecoyEidSensor`, `InboxBuffer`, `Invite`, `Node` (+ опциональный push-sink `NodeEvent`, см. `set_event_sink`).
 
 `mush-jni` — тонкий слой: только `extern "C"` обёртки, Tokio runtime, callback bridge.
 
-Если для Android нужно менять `mush-core` — это признак, что JNI-слой протекает. Остановиться и пересмотреть.
-
-**Проверка:** если для Android нужно менять `mush-core` — это признак, что JNI-слой протекает. Остановиться и пересмотреть.
+**Правило расширения ядра:** generic-точки расширения контракта (например, push-события, новые accessor'ы) допустимы, если они не зависят от JNI/Android и не меняют протокол. Если для Android нужно что-то JNI-специфичное в `mush-core` — это признак, что JNI-слой протекает. Остановиться и пересмотреть.
 
 ---
 
