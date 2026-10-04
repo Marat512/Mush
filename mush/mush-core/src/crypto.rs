@@ -3,6 +3,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+pub mod ratchet;
+
 /// Derive a 32-byte symmetric key via HKDF-SHA256
 /// (`salt` and `info` exactly as specified by the protocol).
 pub fn hkdf_derive(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
@@ -15,13 +17,23 @@ pub fn hkdf_derive(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
 
 /// AES-256-GCM encrypt. `nonce` must be 12 bytes. Ciphertext includes the 16-byte tag.
 pub fn aes_gcm_encrypt(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
+    aes_gcm_encrypt_aad(key, plaintext, nonce, b"")
+}
+
+/// AES-256-GCM encrypt with associated data (этап A: X3DH first message, ratchet).
+pub fn aes_gcm_encrypt_aad(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+) -> Vec<u8> {
     let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
     cipher
         .encrypt(
             Nonce::from_slice(nonce),
             Payload {
                 msg: plaintext,
-                aad: b"",
+                aad,
             },
         )
         .expect("aes-gcm encrypt")
@@ -29,13 +41,23 @@ pub fn aes_gcm_encrypt(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> Ve
 
 /// AES-256-GCM decrypt. Returns None on wrong key / corrupted ciphertext.
 pub fn aes_gcm_decrypt(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; 12]) -> Option<Vec<u8>> {
+    aes_gcm_decrypt_aad(key, ciphertext, nonce, b"")
+}
+
+/// AES-256-GCM decrypt with associated data. None on wrong key/AAD/ciphertext.
+pub fn aes_gcm_decrypt_aad(
+    key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce: &[u8; 12],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key).ok()?;
     cipher
         .decrypt(
             Nonce::from_slice(nonce),
             Payload {
                 msg: ciphertext,
-                aad: b"",
+                aad,
             },
         )
         .ok()
