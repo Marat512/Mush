@@ -1,6 +1,6 @@
 # MUSH-A'-ANDROID-SPEC — Android прототип (этап A')
 
-**Версия:** 0.1.2  
+**Версия:** 0.1.3  
 **Дата:** 2026-09-30  
 **Статус:** Draft — спецификация Android-прототипа  
 **База:** MUSH-A'-SPEC.md v0.1.1  
@@ -365,7 +365,21 @@ fun startHotspot(context: Context, onReady: (String, Int) -> Unit) {
 
 IP не хардкодить. Получить через NetworkInterface API — Samsung/Xiaomi/Huawei дают разные.
 
-### 6.2. LAN fallback
+**Vendor-факт (протокол испытаний, 2026-10-04):** на устройствах со STA+AP concurrency (Qualcomm, HyperOS) station-wlan0 с WAN-подсетью выигрывает гонку у настоящего AP-интерфейса. Поиск IP AP — двухфазный: сначала ТОЛЬКО ap*/swlan* (10 сек), потом fallback на wlan*. Реализация: `NetworkManager.findApIp(strict)`.
+
+### 6.2. Wi-Fi credentials flow (спецификация, реализация позже)
+
+**Проблема:** клиент должен подключиться к AP владельца ДО скана invite-QR, но пароль softap генерируется системой.
+
+**Flow (целевой):**
+
+1. QR несёт `{ssid, passphrase, ip, port, group_id, group_key}` (встраивается в invite-строку новым полем `wifi=` — спек-правка формата §5.0 на этапе реализации).
+2. Клиент читает QR → `WifiNetworkSpecifier.Builder().setSsid(ssid).setWpa2Passphrase(passphrase)` → системный диалог подключения → подключился → тот же QR даёт invite → `join`.
+3. Никакого ручного ввода пароля.
+
+**Открытый вопрос (проверить на Xiaomi за 30 минут до реализации):** `LocalOnlyHotspotReservation.getSoftApConfiguration().passphrase` (API 30+) и `getWifiConfiguration().preSharedKey` (deprecated, API < 33) на HyperOS возвращают реальный passphrase или null/redacted? Текущие наблюдения: HyperOS НЕ отдаёт passphrase приложению (vendor redaction, в dumpsys `<non-empty>`). Если подтвердится — WifiNetworkSpecifier не сработает, нужен fallback (системный Wi-Fi-QR в формате `WIFI:S:...;T:WPA;P:...;;`, который сканирует сама система). **Реализация не раньше 2 недель** (требует телефоны); сейчас пароль показывается текстом на QR-экране (работает на EMUI 10, не работает на HyperOS).
+
+### 6.3. LAN fallback
 
 Если hotspot не поднялся (permissions, кастомная прошивка, ошибка API):
 
@@ -374,7 +388,17 @@ IP не хардкодить. Получить через NetworkInterface API �
 - Client сканирует → `join` → подключается по TCP.
 - Тот же протокол, тот же framing. Только IP не из hotspot-интерфейса, а из LAN-интерфейса.
 
-### 6.3. Foreground service
+### 6.4. Vendor-протокол испытаний (зафиксировано 2026-10-04)
+
+| Устройство | AP | Клиент | Заметки |
+|------------|-----|--------|---------|
+| Huawei Y5 2019 (EMUI 10, API 29) | ❌ **softap полностью изолирует клиентов от хоста** (ping/TCP 100% loss, проверено с 2-го устройства и с ПК) | ✅ | `ACCESS_FINE_LOCATION` + включённый GPS (иначе SecurityException при granted) |
+| Xiaomi 2312FPCA6G (HyperOS, Android 16, API 36) | ⚠️ passphrase redacted (не отдаётся приложению); rate-limit на частые `startLocalOnlyHotspot` (onFailed=3); лечится fallback на живой ap0 | ✅ | STA+AP concurrency: отдельный `ap0` (10.x); advertised-addr фикс — двухфазный поиск IP |
+| Pixel / Samsung A | ✅ ожидаемо | ✅ | третий телефон для демо |
+
+Вывод по топологиям: роль AP недетерминирована — приложение должно уметь обе роли (текущее поведение: обе умеют, клиент дополнительно сканирует QR). Для демо с 3+ устройствами — Pixel/Samsung как AP.
+
+### 6.5. Foreground service
 
 ```kotlin
 // MushService.kt
@@ -511,9 +535,11 @@ Callback приходит из Rust-треда. Все обновления Stat
 
 ### Milestone 4 — Интеграция (1–1.5 дня)
 
-- [ ] End-to-end: 2 телефона, QR-контакт, /send, сообщение в чате.
-- [ ] Все 8 критериев из §10 проходят.
-- [ ] `cargo test` + `./gradlew test` зелёные.
+- [x] End-to-end: 2 телефона, QR-контакт, /send, сообщение в чате. (принято 2026-10-04, Xiaomi=AP + Huawei=клиент)
+- [x] Все 8 критериев из §10 проходят. (#4 группа-4 — осознанно отложена, см. ниже)
+- [x] `cargo test` + `./gradlew test` зелёные.
+
+**MS5 (группа 4 человека) — статус: отложена.** В Android-спеке, но по логике идёт ПОСЛЕ этапа A (Double Ratchet + group key rotation): группа на 4 нодах сейчас даст мало нового — CRDT merge уже проверен в CLI (3 ноды converge). Возвращается после этапа A, когда появится что ротировать в group key.
 
 **Итого: 5–6 дней.** Не 3. JNI + hotspot + foreground service — три вещи, которые съедают больше, чем планируешь.
 
