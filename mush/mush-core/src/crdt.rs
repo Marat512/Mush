@@ -15,11 +15,11 @@ pub type LamportClock = u64;
 /// with the group key; `timestamp` is a Lamport clock, not wall-clock.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub id: String,          // ULID
-    pub sender: PubKey,      // Ed25519 pubkey
-    pub content: Vec<u8>,    // AES-256-GCM encrypted
+    pub id: String,       // ULID
+    pub sender: PubKey,   // Ed25519 pubkey
+    pub content: Vec<u8>, // AES-256-GCM encrypted
     pub timestamp: LamportClock,
-    pub nonce: [u8; 12],     // GCM nonce
+    pub nonce: [u8; 12], // GCM nonce
 }
 
 /// Ad-hoc group (A'-SPEC §4.1): no host, CRDT merge on contact.
@@ -160,7 +160,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// Hex-decode a string; odd length or invalid chars -> None.
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -201,12 +201,24 @@ mod tests {
 
         // Merge in different orders.
         store_a.merge(&[m2.clone(), m3.clone()]);
-        store_b.merge(&[m3.clone()]);
-        store_c.merge(&[m2.clone()]);
+        store_b.merge(std::slice::from_ref(&m3));
+        store_c.merge(std::slice::from_ref(&m2));
 
-        let hist_a: Vec<String> = store_a.history().iter().map(|m| store_a.decrypt(m).unwrap()).collect();
-        let hist_b: Vec<String> = store_b.history().iter().map(|m| store_b.decrypt(m).unwrap()).collect();
-        let hist_c: Vec<String> = store_c.history().iter().map(|m| store_c.decrypt(m).unwrap()).collect();
+        let hist_a: Vec<String> = store_a
+            .history()
+            .iter()
+            .map(|m| store_a.decrypt(m).unwrap())
+            .collect();
+        let hist_b: Vec<String> = store_b
+            .history()
+            .iter()
+            .map(|m| store_b.decrypt(m).unwrap())
+            .collect();
+        let hist_c: Vec<String> = store_c
+            .history()
+            .iter()
+            .map(|m| store_c.decrypt(m).unwrap())
+            .collect();
 
         assert_eq!(hist_a, hist_b);
         assert_eq!(hist_b, hist_c);
@@ -305,8 +317,11 @@ mod tests {
         for w in stamps.windows(2) {
             assert!(w[0] <= w[1], "lamport order must be monotonic");
         }
-        let keys: HashSet<(u64, String)> =
-            a.history().iter().map(|m| (m.timestamp, m.id.clone())).collect();
+        let keys: HashSet<(u64, String)> = a
+            .history()
+            .iter()
+            .map(|m| (m.timestamp, m.id.clone()))
+            .collect();
         assert_eq!(keys.len(), a.len(), "(lamport, id) must be unique");
     }
 

@@ -42,7 +42,10 @@ impl Frame {
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let body_len = 1 + frame.payload.len();
     if body_len as u32 > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     w.write_u32(body_len as u32).await?;
     w.write_u8(frame.msg_type).await?;
@@ -58,7 +61,10 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Option
         Err(e) => return Err(e),
     };
     if len == 0 || len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad frame length"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad frame length",
+        ));
     }
     let msg_type = r.read_u8().await?;
     let mut payload = vec![0u8; (len - 1) as usize];
@@ -82,13 +88,26 @@ mod tests {
     #[tokio::test]
     async fn frame_roundtrip_over_memory_pipe() {
         let (mut a, mut b) = duplex(1024);
-        let frame = Frame::typed(TYPE_TEXT, &Ping { seq: 7, text: "hello".into() }).unwrap();
+        let frame = Frame::typed(
+            TYPE_TEXT,
+            &Ping {
+                seq: 7,
+                text: "hello".into(),
+            },
+        )
+        .unwrap();
         write_frame(&mut a, &frame).await.unwrap();
         drop(a);
         let got = read_frame(&mut b).await.unwrap().expect("frame");
         assert_eq!(got.msg_type, TYPE_TEXT);
         let decoded: Ping = got.decode().unwrap();
-        assert_eq!(decoded, Ping { seq: 7, text: "hello".into() });
+        assert_eq!(
+            decoded,
+            Ping {
+                seq: 7,
+                text: "hello".into()
+            }
+        );
         assert!(read_frame(&mut b).await.unwrap().is_none());
     }
 
@@ -109,7 +128,14 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         for seq in 0..5 {
-            let ping = Frame::typed(TYPE_TEXT, &Ping { seq, text: "mush".into() }).unwrap();
+            let ping = Frame::typed(
+                TYPE_TEXT,
+                &Ping {
+                    seq,
+                    text: "mush".into(),
+                },
+            )
+            .unwrap();
             write_frame(&mut client, &ping).await.unwrap();
             let reply = read_frame(&mut client).await.unwrap().expect("reply");
             let decoded: Ping = reply.decode().unwrap();

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }} — test, clippy, fmt
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mush
+
+      - name: cargo fmt --check
+        working-directory: mush
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -- -D warnings
+        working-directory: mush
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test --release
+        working-directory: mush
+        run: cargo test --release --all-targets
+
+  smoke:
+    name: ${{ matrix.os }} — two-node smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mush
+
+      - name: Build release binary
+        working-directory: mush
+        run: cargo build --release --bin mush-node
+
+      - name: Smoke: two nodes exchange a message
+        working-directory: mush
+        run: bash scripts/smoke.sh

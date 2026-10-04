@@ -8,7 +8,11 @@ use mush_core::transport::{self, Node};
 
 /// Mush A'-CLI node (MUSH-A'-CLI-SPEC).
 #[derive(Parser, Debug)]
-#[command(name = "mush-node", version, about = "Mush A' prototype node (Rust CLI)")]
+#[command(
+    name = "mush-node",
+    version,
+    about = "Mush A' prototype node (Rust CLI)"
+)]
 struct Args {
     /// Display name of this node.
     #[arg(long, default_value = "anon")]

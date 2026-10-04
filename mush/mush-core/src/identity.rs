@@ -49,7 +49,9 @@ impl Identity {
     /// Returns None if the point does not decompress.
     pub fn ed_pubkey_to_x25519(pubkey: &[u8; 32]) -> Option<[u8; 32]> {
         let compressed = curve25519_dalek::edwards::CompressedEdwardsY(*pubkey);
-        compressed.decompress().map(|point| point.to_montgomery().to_bytes())
+        compressed
+            .decompress()
+            .map(|point| point.to_montgomery().to_bytes())
     }
 
     /// Shortcut: X25519 shared secret between this identity and a peer's

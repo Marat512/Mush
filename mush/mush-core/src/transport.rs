@@ -6,15 +6,19 @@ use serde::{Deserialize, Serialize};
 use tokio::io;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
+use crate::base64;
 use crate::crdt::{hex, AdHocGroup, ChatMessage, GroupId, PubKey};
 use crate::framing::{self, Frame, TYPE_DECOY, TYPE_HANDSHAKE, TYPE_SYNC, TYPE_TEXT};
 use crate::identity::Identity;
-use crate::sensors::{now_millis, Alert, ContactRateSensor, DecoyEidSensor, InboxBuffer, IncomingMessage};
-use crate::sns::{HandshakeInitiator, HandshakeMessage, HandshakeResponder, HandshakeError, SnsSession, NONCE_TTL};
-use crate::base64;
+use crate::sensors::{
+    now_millis, Alert, ContactRateSensor, DecoyEidSensor, InboxBuffer, IncomingMessage,
+};
+use crate::sns::{
+    HandshakeError, HandshakeInitiator, HandshakeMessage, HandshakeResponder, SnsSession, NONCE_TTL,
+};
 use rand::RngCore;
 
 /// One confirmed peer connection.
@@ -58,7 +62,10 @@ impl Invite {
     }
 
     pub fn parse(s: &str) -> Result<Invite, String> {
-        let body = s.trim().strip_prefix("mush://").ok_or("not a mush:// link")?;
+        let body = s
+            .trim()
+            .strip_prefix("mush://")
+            .ok_or("not a mush:// link")?;
         // First segment (before any '&') is the bare pubkey base64 — it must be
         // split off BEFORE the key=value parsing because base64 padding is '='.
         let (pk_part, query) = match body.split_once('&') {
@@ -66,7 +73,8 @@ impl Invite {
             None => (body, ""),
         };
         let pk_bytes = base64::decode(pk_part).ok_or("bad pubkey base64")?;
-        let pubkey = <[u8; 32]>::try_from(pk_bytes.as_slice()).map_err(|_| "pubkey must be 32 bytes")?;
+        let pubkey =
+            <[u8; 32]>::try_from(pk_bytes.as_slice()).map_err(|_| "pubkey must be 32 bytes")?;
 
         let mut nonce = None;
         let mut addr = None;
@@ -78,7 +86,10 @@ impl Invite {
             match key {
                 "nonce" => {
                     let bytes = base64::decode(val).ok_or("bad nonce base64")?;
-                    nonce = Some(<[u8; 16]>::try_from(bytes.as_slice()).map_err(|_| "nonce must be 16 bytes")?);
+                    nonce = Some(
+                        <[u8; 16]>::try_from(bytes.as_slice())
+                            .map_err(|_| "nonce must be 16 bytes")?,
+                    );
                 }
                 "addr" => addr = Some(val.to_string()),
                 "group" => {
@@ -86,8 +97,10 @@ impl Invite {
                     let gid = base64::decode(gid_b64).ok_or("bad group id base64")?;
                     let gkey = base64::decode(gkey_b64).ok_or("bad group key base64")?;
                     group = Some((
-                        <[u8; 32]>::try_from(gid.as_slice()).map_err(|_| "group id must be 32 bytes")?,
-                        <[u8; 32]>::try_from(gkey.as_slice()).map_err(|_| "group key must be 32 bytes")?,
+                        <[u8; 32]>::try_from(gid.as_slice())
+                            .map_err(|_| "group id must be 32 bytes")?,
+                        <[u8; 32]>::try_from(gkey.as_slice())
+                            .map_err(|_| "group key must be 32 bytes")?,
                     ));
                 }
                 _ => {}
@@ -212,7 +225,9 @@ impl Node {
     }
 
     fn purge_invites(&mut self) {
-        let cutoff = Instant::now().checked_sub(NONCE_TTL).unwrap_or_else(Instant::now);
+        let cutoff = Instant::now()
+            .checked_sub(NONCE_TTL)
+            .unwrap_or_else(Instant::now);
         self.issued_nonces.retain(|_, at| *at > cutoff);
     }
 
@@ -222,12 +237,14 @@ impl Node {
             // The working group: the joined group if there is exactly one with
             // content, otherwise the only group. A node that joined drops its
             // empty auto-created group (see join_peer), keeping this unambiguous.
-            return self.groups.keys().next().copied().filter(|_| self.groups.len() == 1);
+            return self
+                .groups
+                .keys()
+                .next()
+                .copied()
+                .filter(|_| self.groups.len() == 1);
         }
-        let mut found = self
-            .groups
-            .keys()
-            .filter(|&g| hex(g).starts_with(prefix));
+        let mut found = self.groups.keys().filter(|&g| hex(g).starts_with(prefix));
         let first = found.next()?;
         if found.next().is_some() {
             None // ambiguous
@@ -263,7 +280,10 @@ impl Node {
     ) {
         self.contacts.insert(
             session.peer_pubkey,
-            Contact { name: session.peer_name.clone(), last_seen: Some(Instant::now()) },
+            Contact {
+                name: session.peer_name.clone(),
+                last_seen: Some(Instant::now()),
+            },
         );
         if let Some(group) = self.groups.get_mut(&group_id) {
             group.add_member(session.peer_pubkey);
@@ -295,7 +315,8 @@ impl Node {
             return Err(HandshakeError::NonceMismatch);
         }
         let mut responder = HandshakeResponder::new(self.identity.clone(), Some(offer.nonce));
-        let (reply, session) = responder.respond(offer, &self.name, self.s7.active_decoys().to_vec())?;
+        let (reply, session) =
+            responder.respond(offer, &self.name, self.s7.active_decoys().to_vec())?;
         // One-time token: consumed on successful handshake.
         self.issued_nonces.remove(&offer.nonce);
         Ok((reply, session))
@@ -331,8 +352,10 @@ impl Node {
 
         if !self.groups.contains_key(&invite.group_id) {
             let me = self.pubkey();
-            self.groups
-                .insert(invite.group_id, AdHocGroup::join(invite.group_id, invite.group_key, &me));
+            self.groups.insert(
+                invite.group_id,
+                AdHocGroup::join(invite.group_id, invite.group_key, &me),
+            );
             // The joined group becomes the working group: drop our own
             // auto-created group if it is still empty (no messages, only us).
             let dead: Vec<GroupId> = self
@@ -361,11 +384,16 @@ impl Node {
 
     /// Handle one inbound frame from a confirmed peer connection.
     pub async fn process_frame(&mut self, conn: &PubKey, frame: &Frame) {
-        self.contacts.entry(*conn).and_modify(|c| c.last_seen = Some(Instant::now()));
+        self.contacts
+            .entry(*conn)
+            .and_modify(|c| c.last_seen = Some(Instant::now()));
         match frame.msg_type {
             TYPE_TEXT => {
                 let Ok(msg) = frame.decode::<ChatMessage>() else {
-                    tracing::warn!("undecodable text frame from {}", crate::sensors::short_key(conn));
+                    tracing::warn!(
+                        "undecodable text frame from {}",
+                        crate::sensors::short_key(conn)
+                    );
                     return;
                 };
                 let Some(group_id) = self.peers.get(conn).map(|p| p.group_id) else {
@@ -380,7 +408,9 @@ impl Node {
                 }
                 let (text, group_label) = match self.groups.get(&group_id) {
                     Some(group) => (
-                        group.decrypt(&msg).unwrap_or_else(|| "<undecryptable>".into()),
+                        group
+                            .decrypt(&msg)
+                            .unwrap_or_else(|| "<undecryptable>".into()),
                         Self::group_label(&group_id),
                     ),
                     None => return,
@@ -391,14 +421,21 @@ impl Node {
                     text,
                     received_at: std::time::SystemTime::now(),
                 });
-                let entry = self.pending_bursts.entry(msg.sender).or_insert((0, Instant::now()));
+                let entry = self
+                    .pending_bursts
+                    .entry(msg.sender)
+                    .or_insert((0, Instant::now()));
                 entry.0 += 1;
                 entry.1 = Instant::now();
                 self.relay(conn, frame).await;
             }
             TYPE_SYNC => {
-                let Ok(sync) = frame.decode::<SyncPayload>() else { return };
-                let Some(group_id) = self.peers.get(conn).map(|p| p.group_id) else { return };
+                let Ok(sync) = frame.decode::<SyncPayload>() else {
+                    return;
+                };
+                let Some(group_id) = self.peers.get(conn).map(|p| p.group_id) else {
+                    return;
+                };
                 if let Some(max_lamport) = sync.max_lamport {
                     // Request: reply with everything newer.
                     let messages = self
@@ -406,7 +443,13 @@ impl Node {
                         .get(&group_id)
                         .map(|g| g.since(max_lamport))
                         .unwrap_or_default();
-                    let reply = match Frame::typed(TYPE_SYNC, &SyncPayload { max_lamport: None, messages: Some(messages) }) {
+                    let reply = match Frame::typed(
+                        TYPE_SYNC,
+                        &SyncPayload {
+                            max_lamport: None,
+                            messages: Some(messages),
+                        },
+                    ) {
                         Ok(f) => f,
                         Err(_) => return,
                     };
@@ -418,18 +461,26 @@ impl Node {
                         None => 0,
                     };
                     if merged > 0 {
-                        tracing::info!("Synced {merged} message(s) from {}", self.contact_name(conn));
+                        tracing::info!(
+                            "Synced {merged} message(s) from {}",
+                            self.contact_name(conn)
+                        );
                     }
                 }
             }
             TYPE_DECOY => {
-                let Ok(decoy) = frame.decode::<DecoyPayload>() else { return };
+                let Ok(decoy) = frame.decode::<DecoyPayload>() else {
+                    return;
+                };
                 if let Some(alert) = self.s7.on_bundle(conn, &decoy.destination) {
                     self.push_alert(alert);
                 }
             }
             other => {
-                tracing::warn!("unexpected frame type {other:#04x} from {}", crate::sensors::short_key(conn));
+                tracing::warn!(
+                    "unexpected frame type {other:#04x} from {}",
+                    crate::sensors::short_key(conn)
+                );
             }
         }
     }
@@ -533,7 +584,10 @@ impl Node {
         for frame in &frame_buf {
             self.broadcast(&group_id, frame).await;
         }
-        println!("[INFO] Sent {n} messages to {}", Self::group_label(&group_id));
+        println!(
+            "[INFO] Sent {n} messages to {}",
+            Self::group_label(&group_id)
+        );
         // Self-check: flooding is exactly the burst pattern S1 watches for.
         if let Some(alert) = self.s1.on_burst(&me, n) {
             self.push_alert(alert);
@@ -545,10 +599,17 @@ impl Node {
         let group_id = self
             .resolve_group(group_prefix)
             .ok_or_else(|| format!("unknown group '{group_prefix}'"))?;
-        let max_lamport = self.groups.get(&group_id).map(|g| g.max_lamport()).unwrap_or(0);
+        let max_lamport = self
+            .groups
+            .get(&group_id)
+            .map(|g| g.max_lamport())
+            .unwrap_or(0);
         let frame = Frame::typed(
             TYPE_SYNC,
-            &SyncPayload { max_lamport: Some(max_lamport), messages: None },
+            &SyncPayload {
+                max_lamport: Some(max_lamport),
+                messages: None,
+            },
         )
         .map_err(|e| e.to_string())?;
         let targets: Vec<PubKey> = self
@@ -581,7 +642,9 @@ impl Node {
     /// Execute one CLI command (CLI-SPEC §2.3). Returns true if the node should quit.
     pub async fn handle_command(&mut self, line: &str) -> bool {
         let mut parts = line.split_whitespace();
-        let Some(cmd) = parts.next() else { return false };
+        let Some(cmd) = parts.next() else {
+            return false;
+        };
         let rest: Vec<&str> = parts.collect();
         match cmd {
             "/send" => {
@@ -613,7 +676,13 @@ impl Node {
                         .last_seen
                         .map(|t| format!("{}s ago", t.elapsed().as_secs()))
                         .unwrap_or_else(|| "never".into());
-                    println!("{} {} (key {}, last seen {})", c.name, crate::sensors::short_key(key), hex(key)[..12].to_string(), seen);
+                    println!(
+                        "{} {} (key {}, last seen {})",
+                        c.name,
+                        crate::sensors::short_key(key),
+                        &hex(key)[..12],
+                        seen
+                    );
                 }
             }
             "/sync" => {
@@ -661,7 +730,9 @@ impl Node {
     }
 
     pub fn history_texts(&self, group_prefix: &str) -> Vec<String> {
-        let Some(group_id) = self.resolve_group(group_prefix) else { return Vec::new() };
+        let Some(group_id) = self.resolve_group(group_prefix) else {
+            return Vec::new();
+        };
         match self.groups.get(&group_id) {
             Some(group) => group
                 .history()
@@ -711,7 +782,10 @@ impl Node {
             return;
         };
         let mut writer = writer;
-        if framing::write_frame(&mut writer, &reply_frame).await.is_err() {
+        if framing::write_frame(&mut writer, &reply_frame)
+            .await
+            .is_err()
+        {
             return;
         }
         let peer_key = session.peer_pubkey;
@@ -736,11 +810,17 @@ impl Node {
         }
         let mut n = node.lock().await;
         n.peers.remove(&peer_key);
-        n.contacts.entry(peer_key).and_modify(|c| c.last_seen = Some(Instant::now()));
+        n.contacts
+            .entry(peer_key)
+            .and_modify(|c| c.last_seen = Some(Instant::now()));
     }
 
     /// Read loop for an outbound (joined) connection.
-    pub async fn outbound_loop(node: Arc<Mutex<Node>>, peer_key: PubKey, mut reader: OwnedReadHalf) {
+    pub async fn outbound_loop(
+        node: Arc<Mutex<Node>>,
+        peer_key: PubKey,
+        mut reader: OwnedReadHalf,
+    ) {
         loop {
             match framing::read_frame(&mut reader).await {
                 Ok(Some(frame)) => {
@@ -890,7 +970,10 @@ mod tests {
         let invite = Invite::parse(&s).expect("parse");
         assert_eq!(invite.pubkey, node.pubkey());
         assert_eq!(invite.addr, "127.0.0.1:7878");
-        assert_eq!(invite.group_id, node.default_group_id().expect("group created by invite"));
+        assert_eq!(
+            invite.group_id,
+            node.default_group_id().expect("group created by invite")
+        );
     }
 
     #[tokio::test]
@@ -899,11 +982,22 @@ mod tests {
         let (b, _inv_b) = start_node("bob").await;
 
         cmd(&b, &format!("/join {invite}")).await;
-        wait_for(|| async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 }, 3000).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+        )
+        .await;
 
         cmd(&b, "/send default hello alice").await;
-        wait_for(|| async { a.lock().await.history_texts("default").len() == 1 }, 3000).await;
-        assert_eq!(a.lock().await.history_texts("default"), vec!["hello alice".to_string()]);
+        wait_for(
+            || async { a.lock().await.history_texts("default").len() == 1 },
+            3000,
+        )
+        .await;
+        assert_eq!(
+            a.lock().await.history_texts("default"),
+            vec!["hello alice".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -937,19 +1031,36 @@ mod tests {
 
         // Bob sends: relay alice -> carol must deliver it.
         cmd(&b, "/send default from bob").await;
-        wait_for(|| async { c.lock().await.history_texts("default").len() == 1 }, 3000).await;
+        wait_for(
+            || async { c.lock().await.history_texts("default").len() == 1 },
+            3000,
+        )
+        .await;
 
         // Alice appends locally WITHOUT broadcast; carol and bob pull it via /sync.
-        a.lock().await.append_local_only("default", "local secret").unwrap();
+        a.lock()
+            .await
+            .append_local_only("default", "local secret")
+            .unwrap();
         cmd(&c, "/sync default").await;
         cmd(&b, "/sync default").await;
         wait_for(
-            || async { c.lock().await.history_texts("default").contains(&"local secret".to_string()) },
+            || async {
+                c.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"local secret".to_string())
+            },
             3000,
         )
         .await;
         wait_for(
-            || async { b.lock().await.history_texts("default").contains(&"local secret".to_string()) },
+            || async {
+                b.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"local secret".to_string())
+            },
             3000,
         )
         .await;
@@ -972,12 +1083,23 @@ mod tests {
 
         cmd(&b, "/flood 50 default").await;
         wait_for(
-            || async { a.lock().await.alert_strings().iter().any(|s| s.contains("S1 Alert")) },
+            || async {
+                a.lock()
+                    .await
+                    .alert_strings()
+                    .iter()
+                    .any(|s| s.contains("S1 Alert"))
+            },
             5000,
         )
         .await;
         // Sender-side self check also fires.
-        assert!(b.lock().await.alert_strings().iter().any(|s| s.contains("S1 Alert")));
+        assert!(b
+            .lock()
+            .await
+            .alert_strings()
+            .iter()
+            .any(|s| s.contains("S1 Alert")));
     }
 
     #[tokio::test]
@@ -989,7 +1111,13 @@ mod tests {
 
         cmd(&b, "/decoy").await;
         wait_for(
-            || async { a.lock().await.alert_strings().iter().any(|s| s.contains("S7 Alert")) },
+            || async {
+                a.lock()
+                    .await
+                    .alert_strings()
+                    .iter()
+                    .any(|s| s.contains("S7 Alert"))
+            },
             3000,
         )
         .await;

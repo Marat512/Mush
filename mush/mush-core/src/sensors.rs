@@ -17,7 +17,11 @@ pub enum EvidenceTier {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Alert {
     /// S1: message burst far above the contact's baseline.
-    HighRate { from: String, msg_count: usize, median: f64 },
+    HighRate {
+        from: String,
+        msg_count: usize,
+        median: f64,
+    },
     /// S7: bundle arrived at an EID that was never handed to anyone.
     DecoyHit { source: String, decoy: String },
 }
@@ -25,7 +29,11 @@ pub enum Alert {
 impl Alert {
     pub fn render(&self) -> String {
         match self {
-            Alert::HighRate { from, msg_count, median } => {
+            Alert::HighRate {
+                from,
+                msg_count,
+                median,
+            } => {
                 format!("S1 Alert: High rate from {from} ({msg_count} messages, median={median})")
             }
             Alert::DecoyHit { source, decoy } => {
@@ -62,7 +70,10 @@ pub struct ContactRateSensor {
 
 impl ContactRateSensor {
     pub fn new() -> Self {
-        ContactRateSensor { history: HashMap::new(), window: 10 }
+        ContactRateSensor {
+            history: HashMap::new(),
+            window: 10,
+        }
     }
 
     /// Feed one burst of `msg_count` messages from `from`.
@@ -143,7 +154,7 @@ impl DecoyEidSensor {
     /// Rotate decoys every `rotation_period` contacts.
     pub fn on_contact(&mut self) {
         self.contact_count += 1;
-        if self.contact_count % self.rotation_period == 0 {
+        if self.contact_count.is_multiple_of(self.rotation_period) {
             self.rotate();
         }
     }
@@ -215,7 +226,12 @@ impl InboxBuffer {
         let cutoff = SystemTime::now()
             .checked_sub(self.max_age)
             .unwrap_or(UNIX_EPOCH);
-        while self.messages.front().map(|m| m.received_at < cutoff).unwrap_or(false) {
+        while self
+            .messages
+            .front()
+            .map(|m| m.received_at < cutoff)
+            .unwrap_or(false)
+        {
             self.messages.pop_front();
         }
     }
@@ -252,7 +268,11 @@ mod tests {
         let mut s1 = ContactRateSensor::new();
         let alert = s1.on_burst(&key(1), 50).expect("flood must alert");
         match alert {
-            Alert::HighRate { from, msg_count, median } => {
+            Alert::HighRate {
+                from,
+                msg_count,
+                median,
+            } => {
                 assert_eq!(msg_count, 50);
                 assert_eq!(median, 0.0);
                 assert!(!from.is_empty());
@@ -284,7 +304,7 @@ mod tests {
             assert!(s1.on_burst(&key(1), 6).is_none());
         }
         assert!(s1.on_burst(&key(1), 31).is_some()); // 31 > 6*5
-        // 30 messages does NOT alert (not strictly above 5x) but still gets recorded.
+                                                     // 30 messages does NOT alert (not strictly above 5x) but still gets recorded.
         assert!(s1.on_burst(&key(1), 30).is_none());
     }
 
@@ -303,7 +323,9 @@ mod tests {
     fn s7_decoy_hit_alerts() {
         let sensor = DecoyEidSensor::new(key(9));
         let decoy = sensor.active_decoys()[0];
-        let alert = sensor.on_bundle(&key(1), &decoy).expect("decoy hit must alert");
+        let alert = sensor
+            .on_bundle(&key(1), &decoy)
+            .expect("decoy hit must alert");
         match alert {
             Alert::DecoyHit { source, decoy: d } => {
                 assert_eq!(source, short_key(&key(1)));
@@ -375,7 +397,14 @@ mod tests {
 
     #[test]
     fn alert_render_matches_cli_spec() {
-        let alert = Alert::HighRate { from: "Alice".into(), msg_count: 50, median: 0.0 };
-        assert_eq!(alert.render(), "S1 Alert: High rate from Alice (50 messages, median=0)");
+        let alert = Alert::HighRate {
+            from: "Alice".into(),
+            msg_count: 50,
+            median: 0.0,
+        };
+        assert_eq!(
+            alert.render(),
+            "S1 Alert: High rate from Alice (50 messages, median=0)"
+        );
     }
 }

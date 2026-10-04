@@ -192,7 +192,10 @@ impl HandshakeResponder {
             name: name.to_string(),
             decoys,
         };
-        reply.signature = self.identity.sign(&reply.responder_payload(&offer.nonce)).to_vec();
+        reply.signature = self
+            .identity
+            .sign(&reply.responder_payload(&offer.nonce))
+            .to_vec();
 
         let session_key = derive_session_key(&ephemeral, &offer.ephemeral, &offer.nonce, &nonce_b);
         let session = SnsSession {
@@ -285,7 +288,8 @@ mod tests {
         let id_b = Identity::generate();
         let init = HandshakeInitiator::new(id_a, rand_nonce());
         let mut offer = init.start("alice", vec![]);
-        offer.signature[0] ^= 1;        let mut resp = HandshakeResponder::new(id_b, None);
+        offer.signature[0] ^= 1;
+        let mut resp = HandshakeResponder::new(id_b, None);
         assert_eq!(
             resp.respond(&offer, "bob", vec![]).unwrap_err(),
             HandshakeError::BadSignature
