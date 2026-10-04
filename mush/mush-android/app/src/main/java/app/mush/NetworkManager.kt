@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
+import app.mush.ui.MushStore
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -26,7 +27,7 @@ object NetworkManager {
     ) {
         val (ready, whyNot) = Permissions.hotspotReady(context)
         if (!ready) {
-            NodeState.event("hotspot blocked: $whyNot")
+            MushStore.update { s -> s.copy(statusLine = "hotspot blocked: $whyNot") }
             onFailed(-1)
             return
         }
@@ -44,7 +45,7 @@ object NetworkManager {
                         if (ip != null) {
                             onReady(ip)
                         } else {
-                            NodeState.event("hotspot up but no AP interface IP after 15s")
+                            MushStore.update { s -> s.copy(statusLine = "hotspot up but no AP interface IP after 15s") }
                             onFailed(-2)
                         }
                     }
@@ -52,13 +53,13 @@ object NetworkManager {
             }
 
             override fun onFailed(reason: Int) {
-                NodeState.event("hotspot onFailed($reason)")
+                MushStore.update { s -> s.copy(statusLine = "hotspot onFailed($reason)") }
                 onFailed(reason)
             }
 
             override fun onStopped() {
                 reservation = null
-                NodeState.event("hotspot stopped")
+                MushStore.update { s -> s.copy(statusLine = "hotspot stopped") }
             }
         }
         wifi.startLocalOnlyHotspot(callback, Handler(Looper.getMainLooper()))
