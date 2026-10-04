@@ -300,9 +300,9 @@ pub extern "C" fn Java_app_mush_Native_flood(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        Ok(runtime().block_on(unsafe {
-            node_flood(handle as *mut node::JniNode, n.max(0) as usize)
-        })? as jboolean)
+        Ok(runtime()
+            .block_on(unsafe { node_flood(handle as *mut node::JniNode, n.max(0) as usize) })?
+            as jboolean)
     }));
     match result {
         Ok(Ok(b)) => b,
