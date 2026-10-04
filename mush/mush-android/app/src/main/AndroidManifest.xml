@@ -14,6 +14,7 @@
 
     <application
         android:allowBackup="false"
+        android:icon="@drawable/ic_mush"
         android:label="Mush"
         android:theme="@style/Theme.Mush"
         android:supportsRtl="true">
@@ -26,5 +27,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".MushService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
     </application>
 </manifest>
