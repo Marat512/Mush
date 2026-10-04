@@ -4,6 +4,7 @@ pub mod framing;
 pub mod identity;
 pub mod sensors;
 pub mod sns;
+pub mod transport;
 
 /// Standard base64 alphabet (RFC 4648) with padding. Implemented locally to
 /// keep the dependency footprint matching MUSH-A'-CLI-SPEC.

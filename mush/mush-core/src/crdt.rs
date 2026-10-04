@@ -189,6 +189,7 @@ mod tests {
 
         // A produces m1; B (after sync of m1) produces m2; C produces m3 concurrently.
         let m1 = store_a.append_local(&alice, "hello from alice");
+        assert_eq!(m1.timestamp, 1);
 
         let mut store_b = AdHocGroup::join(gid, gkey, &bob);
         store_b.merge(&store_a.history());
@@ -232,13 +233,12 @@ mod tests {
     #[test]
     fn sync_returns_only_missing_messages() {
         let alice = key(1);
-        let bob = key(2);
         let mut a = AdHocGroup::create(&alice);
-        a.append_local(&alice, "one");
-        let m2 = a.append_local(&alice, "two");
-        let m3 = a.append_local(&alice, "three");
+        let m1 = a.append_local(&alice, "one");
+        a.append_local(&alice, "two");
+        a.append_local(&alice, "three");
 
-        let peer_max = 1u64; // peer has only lamport 1
+        let peer_max = m1.timestamp; // peer has only lamport 1
         let missing = a.since(peer_max);
         assert_eq!(missing.len(), 2);
         assert_eq!(a.decrypt(&missing[0]).unwrap(), "two");

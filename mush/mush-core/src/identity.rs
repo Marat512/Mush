@@ -4,6 +4,7 @@ use sha2::Digest;
 use x25519_dalek::StaticSecret;
 
 /// Ed25519 identity keypair of a node. Generated once at first start.
+#[derive(Clone)]
 pub struct Identity {
     signing_key: SigningKey,
 }
