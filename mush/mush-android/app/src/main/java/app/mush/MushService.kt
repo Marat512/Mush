@@ -113,6 +113,9 @@ class MushService : Service() {
         }
         try {
             val h = Native.init(filesDir.absolutePath, callback)
+            // Этап A: Android всегда ratchet-режим (X3DH + Double Ratchet),
+            // до startListener — иначе пользователи получили бы legacy E2E.
+            Native.setCryptoMode(h, 1)
             val pubkey = Native.pubkey(h)
             val port = Native.startListener(h, 0)
             handle = h

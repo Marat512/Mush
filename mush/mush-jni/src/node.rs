@@ -175,6 +175,19 @@ pub async unsafe fn node_decoy(handle: *mut JniNode) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Этап A: режим криптографии (0 = Legacy, 1 = Ratchet). Android всегда
+/// Ratchet (MUSH-A'-ANDROID-SPEC §13); вызывать до startListener.
+pub async unsafe fn node_set_crypto_mode(handle: *mut JniNode, mode: i32) -> Result<(), String> {
+    let node = &*handle;
+    let m = match mode {
+        0 => mush_core::transport::CryptoMode::Legacy,
+        1 => mush_core::transport::CryptoMode::Ratchet,
+        other => return Err(format!("bad crypto mode {other}")),
+    };
+    node.node.lock().await.set_crypto_mode(m);
+    Ok(())
+}
+
 /// Override the address invites carry (hotspot/LAN interface IP). Empty/// string clears the override. Invites minted afterwards use it.
 pub async unsafe fn node_set_advertised_addr(
     handle: *mut JniNode,
@@ -357,6 +370,48 @@ mod tests {
             let a = node_init("", sink).expect("init");
             let ok = unsafe { node_connect(a, "127.0.0.1", 1) }.unwrap(); // port 1: closed
             assert!(!ok);
+            unsafe { node_shutdown(a) };
+        });
+    }
+}
+
+#[cfg(test)]
+mod crypto_mode_tests {
+    use super::*;
+    use crate::callback::EventSink;
+
+    struct Noop;
+    impl EventSink for Noop {
+        fn on_message(&self, _: &[u8; 32], _: &[u8; 32], _: &str, _: u64) {}
+        fn on_sensor_alert(&self, _: &str, _: &str, _: &str) {}
+        fn on_handshake_complete(&self, _: &[u8; 32], _: &str) {}
+        fn on_error(&self, _: i32, _: &str) {}
+    }
+
+    fn noop() -> Arc<Noop> {
+        Arc::new(Noop)
+    }
+
+    #[test]
+    fn set_crypto_mode_ratchet_makes_invite_carry_bundle() {
+        runtime().block_on(async {
+            let sink = noop();
+            let a = node_init("", sink.clone()).expect("init");
+            unsafe { node_set_crypto_mode(a, 1).await }.unwrap();
+            unsafe { node_start_listener(a, 18441).await }.unwrap();
+            let invite = unsafe { node_invite(a).await }.unwrap();
+            assert!(invite.contains("pk="), "ratchet invite несёт pk= bundle");
+            unsafe { node_shutdown(a) };
+        });
+    }
+
+    #[test]
+    fn set_crypto_mode_rejects_bad_value() {
+        runtime().block_on(async {
+            let sink = noop();
+            let a = node_init("", sink).expect("init");
+            let err = unsafe { node_set_crypto_mode(a, 7) }.await.unwrap_err();
+            assert!(err.contains("bad crypto mode"));
             unsafe { node_shutdown(a) };
         });
     }

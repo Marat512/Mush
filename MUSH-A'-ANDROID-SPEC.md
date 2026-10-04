@@ -622,3 +622,4 @@ API: `Identity`, `HandshakeInitiator`/`HandshakeResponder`, `Frame`/`framing`, `
 - Переделать onboarding и transport.
 - Не добавлять сложности.
 - Не начинать этап A.
+**Этап A (E2E) и Android:** в `mush-core` появился `CryptoMode::{Legacy, Ratchet}` (X3DH + Double Ratchet, см. `mush/docs/MUSH-A-SPEC.md`). CLI-smoke работает на Legacy (default); **Android-сборка ОБЯЗАНА включать Ratchet через `Native.setCryptoMode(handle, 1)` до `startListener`** — иначе пользователи получат legacy E2E. В Ratchet-режиме invite несёт pre-key bundle (поле `pk=`), join прозрачен для Kotlin-кода (та же строка invite). Групповое ограничение relay-перешифровки (relay видит plaintext) — MUSH-A-SPEC §4.0, ATTACK-MODEL §2.

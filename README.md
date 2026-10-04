@@ -6,7 +6,13 @@
 
 ## Статус
 
-Реализован прототип **этапа A' — Rust CLI** ([MUSH-A'-CLI-SPEC](MUSH-A'-CLI-SPEC.md), критерии приёмки §7 — все пройдены):
+Реализовано и принято (все критерии пройдены, CI зелёный):
+
+- **A'-CLI** ([MUSH-A'-CLI-SPEC](MUSH-A'-CLI-SPEC.md)): Rust-ноды на localhost, SNS-handshake, CRDT на 3 нодах, сенсоры S1/S7, smoke-скрипт.
+- **A'-Android** ([MUSH-A'-ANDROID-SPEC](MUSH-A'-ANDROID-SPEC.md)): JNI-мост (mush-jni), foreground service, hotspot/LAN-fallback, Compose UI (6 экранов + QR ZXing), интеграция на двух физических устройствах (Huawei Y5 2019 + Xiaomi HyperOS). Vendor-протокол испытаний — §6.4 спеки.
+- **Этап A — E2E-криптография** ([mush/docs/MUSH-A-SPEC.md](mush/docs/MUSH-A-SPEC.md)): X3DH + Double Ratchet в `mush-core::crypto::ratchet` (golden vectors, out-of-order, anti-replay, FS-тесты, session persistence), transport dual-mode (`CryptoMode::Legacy | Ratchet`), 4-нодная интеграция с relay-перешифровкой, восстановление после потерь в DTN.
+
+CLI quickstart (legacy-режим, default):
 
 ```
 cd mush
@@ -22,7 +28,9 @@ cargo test --release   # 42 теста: crypto, handshake, CRDT, sensors, 2/3-н
 bash mush/scripts/smoke.sh  # smoke: два реальных процесса, 6 проверок
 ```
 
-Что проверено: SNS-handshake (Ed25519 + X25519 + HKDF), CRDT-сходимость на 3 нодах, сенсоры S1/S7, backpressure, one-time invite. Чего нет (этапы A–E): Android/Kotlin, Hotspot/QR, Double Ratchet, Onion, Fruiting Gateway, Immune plane, Vironet.
+Что проверено: SNS-handshake (Ed25519 + X25519 + HKDF), CRDT-сходимость на 3 нодах, сенсоры S1/S7, backpressure, one-time invite, X3DH + Double Ratchet (этап A: pairwise E2E, FS, out-of-order, persistence), Android-прототип (hotspot, QR, foreground service). Чего нет (этапы B–E): Vault/SQLCipher, Safety Number, Onion, Fruiting Gateway + group E2E (sender keys), Immune plane, Vironet.
+
+**Следующий:** этап B (Vault, SQLCipher, Identicon, Safety Number) + Android hardware-проверка на Pixel/Samsung. Group E2E через sender keys — этап D. Документированное ограничение A': relay групповых сообщений видит plaintext (ATTACK-MODEL §2, MUSH-A-SPEC §4.0).
 
 ## Документация
 

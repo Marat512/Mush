@@ -23,7 +23,7 @@ use callback::{EventSink, KotlinCallback};
 use errors::throw;
 use node::{
     node_connect, node_decoy, node_flood, node_init, node_invite, node_join, node_pubkey,
-    node_send, node_set_advertised_addr, node_shutdown, node_start_listener,
+    node_send, node_set_advertised_addr, node_set_crypto_mode, node_shutdown, node_start_listener,
 };
 use runtime::runtime;
 
@@ -339,6 +339,26 @@ pub extern "C" fn Java_app_mush_Native_decoy(
             throw(&mut env, "Rust panic in Native.decoy");
             0
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_setCryptoMode(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    mode: jint,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        runtime().block_on(unsafe { node_set_crypto_mode(handle as *mut node::JniNode, mode) })
+    }));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => throw(&mut env, &e),
+        Err(_) => throw(&mut env, "Rust panic in Native.setCryptoMode"),
     }
 }
 

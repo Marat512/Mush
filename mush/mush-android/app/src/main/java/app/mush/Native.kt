@@ -30,5 +30,7 @@ object Native {
     // Debug hooks для §10 (критерии 6/7): триггер S1/S7 вручную.
     external fun flood(handle: Long, n: Int): Boolean
     external fun decoy(handle: Long): Boolean
+    // Этап A: 0 = Legacy, 1 = Ratchet. Android всегда 1 (§13).
+    external fun setCryptoMode(handle: Long, mode: Int)
     external fun shutdown(handle: Long)
 }

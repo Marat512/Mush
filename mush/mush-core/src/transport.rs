@@ -34,6 +34,10 @@ struct Peer {
     group_id: GroupId,
     /// Этап A, ratchet-режим: pairwise Double Ratchet сессия с этим пиром.
     ratchet: Option<crate::crypto::ratchet::RatchetSession>,
+    /// Этап A: получили ли хотя бы один ratchet-фрейм от этого пира.
+    /// Пока false — к каждому исходящему фрейму подмешивается активация
+    /// (восстановление при потере первой активации в DTN, MUSH-A-SPEC §4.0.1).
+    seen_incoming: bool,
 }
 
 /// Known contact (CLI-SPEC: /contacts).
@@ -211,6 +215,10 @@ pub struct Node {
     pre_key_store: ratchet::PreKeyStore,
     /// Этап A: tombstone использованных бандлов на стороне initiator'а.
     bundle_consumer: ratchet::BundleConsumer,
+    /// Этап A: отправлять ли активацию сразу после join (default true).
+    /// Тесты отключают, чтобы эмулировать потерю активации в DTN —
+    /// восстановление обязано произойти через folding в send_ratchet_to.
+    activation_enabled: bool,
 }
 
 /// Протокол обмена (MUSH-A-SPEC §5): Legacy — SNS handshake + group_key
@@ -247,7 +255,13 @@ impl Node {
             crypto_mode: CryptoMode::Legacy,
             pre_key_store: ratchet::PreKeyStore::new(identity),
             bundle_consumer: ratchet::BundleConsumer::new(),
+            activation_enabled: true,
         }
+    }
+
+    /// Этап A (тесты): включить/выключить немедленную активацию после join.
+    pub fn set_activation_enabled(&mut self, enabled: bool) {
+        self.activation_enabled = enabled;
     }
 
     /// Этап A: включить ratchet-режим (до `run`/первого invite). Пополняет
@@ -453,6 +467,7 @@ impl Node {
                 session_key: session.session_key,
                 group_id,
                 ratchet: None,
+                seen_incoming: false,
             },
         );
         self.emit(NodeEvent::HandshakeComplete {
@@ -550,6 +565,7 @@ impl Node {
                     session_key: [0u8; 32],
                     group_id: invite.group_id,
                     ratchet: Some(ratchet::RatchetSession::new_initiator(&start, &bundle.spk)),
+                    seen_incoming: false,
                 },
             );
             let me = self
@@ -561,21 +577,24 @@ impl Node {
             });
             // Активация: первое ratchet-сообщение (пустой текст) владельцу —
             // без него responder-сторона не может шифровать (send-цепочка
-            // строится из DH с ratchet-ключом initiator'а).
-            let activation = {
-                let peer = self.peers.get_mut(&peer_key).expect("peer just inserted");
-                peer.ratchet.as_mut().and_then(|s| s.encrypt(b""))
-            };
-            if let Some(msg) = activation {
-                if let Ok(frame) = Frame::typed(
-                    TYPE_RATCHET,
-                    &RatchetFrame {
-                        id: "activation".to_string(),
-                        lamport: 0,
-                        message: msg,
-                    },
-                ) {
-                    self.send_to(&peer_key, &frame).await;
+            // строится из DH с ratchet-ключом initiator'а). При потере в DTN
+            // восстановление — folding в send_ratchet_to (§4.0.1).
+            if self.activation_enabled {
+                let activation = {
+                    let peer = self.peers.get_mut(&peer_key).expect("peer just inserted");
+                    peer.ratchet.as_mut().and_then(|s| s.encrypt(b""))
+                };
+                if let Some(msg) = activation {
+                    if let Ok(frame) = Frame::typed(
+                        TYPE_RATCHET,
+                        &RatchetFrame {
+                            id: "activation".to_string(),
+                            lamport: 0,
+                            message: msg,
+                        },
+                    ) {
+                        self.send_to(&peer_key, &frame).await;
+                    }
                 }
             }
             return Ok(());
@@ -710,6 +729,9 @@ impl Node {
                         );
                         return;
                     };
+                    // Первый успешно открытый фрейм пира — активация его
+                    // send-цепочки с нашей стороны больше не нужна.
+                    peer.seen_incoming = true;
                     (
                         String::from_utf8_lossy(&bytes).into_owned(),
                         peer.group_id,
@@ -825,6 +847,42 @@ impl Node {
         }
     }
 
+    /// Этап A: отправка ratchet-фрейма пиру. Пока от пира не получено ни
+    /// одного входящего фрейма, СНАЧАЛА подмешивается активация (пустой
+    /// ratchet-фрейм) — идемпотентное восстановление при потере первой
+    /// активации в DTN (MUSH-A-SPEC §4.0.1). Если наша сторона ещё не
+    /// может шифровать (responder без входящих), фрейм пропускается.
+    async fn send_ratchet_to(&mut self, key: &PubKey, frame: Frame) {
+        let activation = {
+            let Some(peer) = self.peers.get_mut(key) else {
+                self.send_to(key, &frame).await;
+                return;
+            };
+            if peer.seen_incoming {
+                None
+            } else {
+                peer.ratchet
+                    .as_mut()
+                    .and_then(|s| s.encrypt(b""))
+                    .and_then(|msg| {
+                        Frame::typed(
+                            TYPE_RATCHET,
+                            &RatchetFrame {
+                                id: "activation".to_string(),
+                                lamport: 0,
+                                message: msg,
+                            },
+                        )
+                        .ok()
+                    })
+            }
+        };
+        if let Some(act) = activation {
+            self.send_to(key, &act).await;
+        }
+        self.send_to(key, &frame).await;
+    }
+
     /// Этап A: ретрансляция ratchet-сообщения — НЕ сырого фрейма, а
     /// перешифровка текстом для каждого пира группы (pairwise сессии).
     /// id/lamport сохраняются — CRDT-мерж и дедуп работают как в legacy.
@@ -857,7 +915,7 @@ impl Node {
             }
         }
         for (key, frame) in frames {
-            self.send_to(&key, &frame).await;
+            self.send_ratchet_to(&key, frame).await;
         }
     }
 
@@ -953,7 +1011,7 @@ impl Node {
                 }
             }
             for (key, frame) in frames {
-                self.send_to(&key, &frame).await;
+                self.send_ratchet_to(&key, frame).await;
             }
         } else {
             let frame = Frame::typed(TYPE_TEXT, &msg).map_err(|e| e.to_string())?;
@@ -1205,6 +1263,7 @@ impl Node {
                         session_key: [0u8; 32],
                         group_id,
                         ratchet: Some(ratchet::RatchetSession::new_responder(&start, spk)),
+                        seen_incoming: false,
                     },
                 );
                 n.emit(NodeEvent::HandshakeComplete {
@@ -1892,5 +1951,72 @@ mod ratchet_mode_tests {
         assert_eq!(parsed2.pk, parsed.pk);
         assert_eq!(parsed2.group_id, parsed.group_id);
         let _ = a.lock().await.peer_count();
+    }
+}
+
+#[cfg(test)]
+mod activation_recovery_tests {
+    //! Потеря активационного фрейма в DTN: обмен обязан восстановиться
+    //! через folding активации в исходящие фреймы (MUSH-A-SPEC §4.0.1).
+    use super::tests::*;
+    use super::{run, CryptoMode};
+    use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test]
+    async fn lost_activation_recovers_on_first_contact() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        // Bob joins С активацией, но активационный фрейм «теряется в DTN»
+        // (эмулЯция: отправка отключена на момент join).
+        let bob = {
+            let node = test_node_mode("bob", CryptoMode::Ratchet);
+            node.lock().await.set_activation_enabled(false);
+            node
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            let n2 = bob.clone();
+            tokio::spawn(async move {
+                let _ = run(n2, mpsc::unbounded_channel().1, Some(tx)).await;
+            });
+        }
+        let _invite_b = rx.await.expect("invite");
+
+        cmd(&bob, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { bob.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+            "peers connected",
+        )
+        .await;
+
+        // Bob пишет первым: вместе с сообщением уходит и (folded) активация.
+        cmd(&bob, "/send default hello after loss").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"hello after loss".to_string())
+            },
+            3000,
+            "a got message",
+        )
+        .await;
+
+        // Теперь alice (responder-сторона, получившая активацию) может
+        // ответить — при потерянной навсегда активации этот шаг был бы
+        // невозможен (send-цепочка не построена).
+        cmd(&a, "/send default recovered reply").await;
+        wait_for(
+            || async {
+                bob.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"recovered reply".to_string())
+            },
+            3000,
+            "b got reply (activation recovered)",
+        )
+        .await;
     }
 }
