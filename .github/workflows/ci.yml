@@ -62,3 +62,54 @@ jobs:
       - name: "Smoke: two nodes exchange a message"
         working-directory: mush
         run: bash scripts/smoke.sh
+
+  android-build:
+    name: android — cargo-ndk + assembleDebug
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mush/mush-android
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mush
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK 26
+        run: sdkmanager --install "ndk;26.1.10909125" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Build JNI libs (aarch64, armv7, x86_64)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.1.10909125
+        run: |
+          cargo ndk -t arm64-v8a -t armv7 -t x86_64 \
+            -o app/src/main/jniLibs build --release -p mush-jni
+
+      - name: Assemble debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Verify .so inside APK
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk)
+          unzip -l "$APK" | grep '\.so$'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mush-android-debug
+          path: mush/mush-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

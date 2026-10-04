@@ -1,0 +1,9 @@
+# Native libraries built by cargo-ndk (MUSH-A'-ANDROID-SPEC, Фаза 0)
+mush/mush-android/app/src/main/jniLibs/
+# Gradle/Android build artifacts
+mush/mush-android/app/build/
+mush/mush-android/build/
+mush/mush-android/.gradle/
+mush/mush-android/local.properties
+*.iml
+.idea/
