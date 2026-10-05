@@ -1,19 +1,42 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
+use rand::RngCore;
 use sha2::Digest;
 use x25519_dalek::StaticSecret;
 
-/// Ed25519 identity keypair of a node. Generated once at first start.
+use crate::crypto::hkdf_derive;
+
+/// Версия seed-формата identity (persist, MUSH-B-SPEC §3).
+pub const IDENTITY_SEED_VERSION: u32 = 1;
+
+/// Ed25519 identity keypair of a node. Generated once at first start
+/// (или восстанавливается из seed при импорте состояния).
 #[derive(Clone)]
 pub struct Identity {
+    seed: [u8; 32],
     signing_key: SigningKey,
 }
 
 impl Identity {
     pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        Self::from_seed(seed)
+    }
+
+    /// Детерминированный identity из seed (HKDF-SHA256 домена
+    /// `Mush-Identity-v1`): один seed — один ключ, восстановимо по persist.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        let key_bytes = hkdf_derive(&seed, b"", b"Mush-Identity-v1");
         Identity {
-            signing_key: SigningKey::generate(&mut OsRng),
+            seed,
+            signing_key: SigningKey::from_bytes(&key_bytes),
         }
+    }
+
+    /// Исходный seed (persist/backup, MUSH-B-SPEC §3).
+    pub fn seed(&self) -> [u8; 32] {
+        self.seed
     }
 
     /// 32-byte Ed25519 public key — the node's identity (EID).
@@ -75,6 +98,32 @@ fn clamp_scalar(scalar: &mut [u8; 32]) {
 mod tests {
     use super::*;
     use x25519_dalek::PublicKey;
+
+    #[test]
+    fn from_seed_is_deterministic() {
+        let seed = [7u8; 32];
+        let a = Identity::from_seed(seed);
+        let b = Identity::from_seed(seed);
+        assert_eq!(a.pubkey_bytes(), b.pubkey_bytes());
+        // Подписи детерминированы (Ed25519) — совпадают полностью.
+        let msg = b"seeded message";
+        assert_eq!(a.sign(msg), b.sign(msg));
+        assert!(Identity::verify(&a.pubkey_bytes(), msg, &a.sign(msg)));
+    }
+
+    #[test]
+    fn seed_accessor_returns_original_seed() {
+        let seed = [42u8; 32];
+        let id = Identity::from_seed(seed);
+        assert_eq!(id.seed(), seed);
+    }
+
+    #[test]
+    fn distinct_seeds_produce_distinct_identities() {
+        let a = Identity::from_seed([1u8; 32]);
+        let b = Identity::from_seed([2u8; 32]);
+        assert_ne!(a.pubkey_bytes(), b.pubkey_bytes());
+    }
 
     #[test]
     fn sign_verify_roundtrip() {

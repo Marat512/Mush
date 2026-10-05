@@ -244,6 +244,11 @@ pub struct Node {
     /// Тесты отключают, чтобы эмулировать потерю активации в DTN —
     /// восстановление обязано произойти через folding в send_ratchet_to.
     activation_enabled: bool,
+    /// Этап B: ratchet-сессии, восстановленные из persist (import_state).
+    /// Peers — это живые TCP-соединения (writer), их нельзя восстановить
+    /// без сети: сессии хранятся отдельно, пока будущий transport/vault-код
+    /// не решит поднимать соединение (MUSH-B-SPEC §3).
+    restored_sessions: HashMap<PubKey, ratchet::RatchetSession>,
 }
 
 /// Протокол обмена (MUSH-A-SPEC §5): Legacy — SNS handshake + group_key
@@ -252,6 +257,24 @@ pub struct Node {
 pub enum CryptoMode {
     Legacy,
     Ratchet,
+}
+
+/// Сериализуемое состояние узла (persist, MUSH-B-SPEC §3). Versioned:
+/// несовпадение version -> import None. Живые TCP-writer'ы и last_seen
+/// (Instant) в persist не входят — восстанавливаются только сессии.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeState {
+    pub version: u32,
+    pub name: String,
+    /// "legacy" | "ratchet" (строка — устойчива к рефакторингу enum'а).
+    pub crypto_mode: String,
+    pub identity_seed: [u8; 32],
+    pub pre_key_store: ratchet::PreKeyStoreState,
+    pub bundle_consumer: ratchet::BundleConsumerState,
+    /// Peer-сессии из активных peers с ratchet (pubkey, состояние).
+    pub peer_sessions: Vec<(PubKey, ratchet::RatchetSessionState)>,
+    /// Контакты: (pubkey, имя). last_seen не сериализуется.
+    pub contacts: Vec<(PubKey, String)>,
 }
 
 impl Node {
@@ -281,6 +304,7 @@ impl Node {
             pre_key_store: ratchet::PreKeyStore::new(identity),
             bundle_consumer: ratchet::BundleConsumer::new(),
             activation_enabled: true,
+            restored_sessions: HashMap::new(),
         };
         // Дефолт — Ratchet: узел сразу готов к X3DH (очередь OPK пополнена
         // до того же уровня, что и при `set_crypto_mode(Ratchet)`).
@@ -344,6 +368,83 @@ impl Node {
             }
             None => false,
         }
+    }
+
+    /// Этап B: сессии, восстановленные из persist (import_state). Смотри
+    /// поле `restored_sessions` — активные TCP-соединения этим не трогаются.
+    pub fn restored_session(&self, peer: &PubKey) -> Option<&ratchet::RatchetSession> {
+        self.restored_sessions.get(peer)
+    }
+
+    /// Извлечь восстановленную сессию (вызыватель решает, когда поднимать
+    /// соединение). Второй вызов вернёт None — извлечение одноразово.
+    pub fn take_restored_session(&mut self, peer: &PubKey) -> Option<ratchet::RatchetSession> {
+        self.restored_sessions.remove(peer)
+    }
+
+    /// Этап B: экспорт узла в persist-форму (MUSH-B-SPEC §3). Versioned.
+    /// Контакты — pubkey+имя; last_seen (Instant) и живые TCP-writer
+    /// не сериализуются.
+    pub fn export_state(&self) -> NodeState {
+        let peer_sessions: Vec<(PubKey, ratchet::RatchetSessionState)> = self
+            .peers
+            .iter()
+            .filter_map(|(pk, peer)| peer.ratchet.as_ref().map(|s| (*pk, s.export_state())))
+            .collect();
+        let mut contacts: Vec<(PubKey, String)> = self
+            .contacts
+            .iter()
+            .map(|(pk, c)| (*pk, c.name.clone()))
+            .collect();
+        contacts.sort_by_key(|c| c.0);
+        NodeState {
+            version: 1,
+            name: self.name.clone(),
+            crypto_mode: match self.crypto_mode {
+                CryptoMode::Legacy => "legacy".to_string(),
+                CryptoMode::Ratchet => "ratchet".to_string(),
+            },
+            identity_seed: self.identity.seed(),
+            pre_key_store: self.pre_key_store.export_state(),
+            bundle_consumer: self.bundle_consumer.export_state(),
+            peer_sessions,
+            contacts,
+        }
+    }
+
+    /// Этап B: восстановление узла из persist. Восстановленные ratchet-сессии
+    /// кладутся в `restored_sessions` (не в peers — peers живут, пока живо
+    /// TCP-соединение). None при version != 1 или порче вложенного state.
+    pub fn import_state(state: &NodeState) -> Option<Node> {
+        if state.version != 1 {
+            return None;
+        }
+        let crypto_mode = match state.crypto_mode.as_str() {
+            "legacy" => CryptoMode::Legacy,
+            "ratchet" => CryptoMode::Ratchet,
+            _ => return None,
+        };
+        let mut node = Node::new(&state.name, 0); // пополнит OPK...
+        let identity = Identity::from_seed(state.identity_seed);
+        node.identity = identity.clone();
+        node.s7 = crate::sensors::DecoyEidSensor::new(identity.pubkey_bytes());
+        node.crypto_mode = crypto_mode;
+        node.pre_key_store = ratchet::PreKeyStore::import_state(&state.pre_key_store)?; // ...store перезаписан
+        node.bundle_consumer = ratchet::BundleConsumer::import_state(&state.bundle_consumer)?;
+        for (pk, session_state) in &state.peer_sessions {
+            let session = ratchet::RatchetSession::import_state(session_state)?;
+            node.restored_sessions.insert(*pk, session);
+        }
+        for (pk, name) in &state.contacts {
+            node.contacts.insert(
+                *pk,
+                Contact {
+                    name: name.clone(),
+                    last_seen: None,
+                },
+            );
+        }
+        Some(node)
     }
 
     /// Attach a push-event sink. Emission is fire-and-forget: if the receiver
@@ -2088,6 +2189,90 @@ mod ratchet_mode_tests {
             "b got back to bob",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn node_state_export_import_restores_identity_contacts_and_sessions() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let (b, _ib) = start_node_mode("bob", CryptoMode::Ratchet).await;
+        cmd(&b, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+            "b peer 1",
+        )
+        .await;
+        cmd(&b, "/send default hello for export").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .history_texts("default")
+                    .contains(&"hello for export".to_string())
+            },
+            3000,
+            "a got hello",
+        )
+        .await;
+
+        let peer_key_a = a.lock().await.pubkey();
+        // Контакт на стороне b (alice — собеседник b).
+        b.lock().await.contacts.insert(
+            peer_key_a,
+            Contact {
+                name: "alice-from-test".to_string(),
+                last_seen: None,
+            },
+        );
+
+        // Export -> CBOR -> import (полный persist-цикл, MUSH-B-SPEC §3).
+        let state = b.lock().await.export_state();
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&state, &mut cbor).expect("cbor");
+        assert!(
+            cbor.len() < 64 * 1024,
+            "NodeState {} bytes >= 64 KB потолка",
+            cbor.len()
+        );
+        let decoded: NodeState = ciborium::de::from_reader(cbor.as_slice()).expect("cbor decode");
+        let mut restored = Node::import_state(&decoded).expect("import");
+
+        // Identity/pubkey совпадает с исходным узлом.
+        assert_eq!(restored.pubkey(), b.lock().await.pubkey());
+        assert_eq!(restored.name, "bob");
+        assert_eq!(restored.crypto_mode(), CryptoMode::Ratchet);
+        // OPK-очередь восстановлена из persist (не дефолтные 50 от new()).
+        assert_eq!(
+            restored.pre_key_store.pending_count(),
+            b.lock().await.pre_key_store.pending_count()
+        );
+
+        // Сессии — в restored_sessions с правильными session_id.
+        let orig_state = b
+            .lock()
+            .await
+            .export_peer_session(&peer_key_a)
+            .expect("orig session");
+        let session = restored
+            .restored_session(&peer_key_a)
+            .expect("restored session");
+        assert_eq!(session.export_state().session_id, orig_state.session_id);
+        // take одноразовый.
+        assert!(restored.take_restored_session(&peer_key_a).is_some());
+        assert!(restored.take_restored_session(&peer_key_a).is_none());
+        // Контакты на месте.
+        assert!(restored.contacts.contains_key(&peer_key_a));
+    }
+
+    #[tokio::test]
+    async fn node_state_import_rejects_bad_version_and_mode() {
+        let node = test_node_mode("solo", CryptoMode::Ratchet);
+        let mut state = node.lock().await.export_state();
+        state.version = 99;
+        assert!(Node::import_state(&state).is_none());
+        let mut state = node.lock().await.export_state();
+        state.crypto_mode = "quantum".to_string();
+        assert!(Node::import_state(&state).is_none());
     }
 
     #[tokio::test]

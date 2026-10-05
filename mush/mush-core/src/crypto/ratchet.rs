@@ -147,6 +147,29 @@ pub struct PreKeyStore {
     next_opk_id: u32,
 }
 
+/// Сериализуемое состояние PreKeyStore (persist, MUSH-B-SPEC §3). Versioned:
+/// несовпадение version -> import None. OPK-пары несут СЕКРЕТЫ (pubkey
+/// перевычисляется при импорте). Подпись SPK — скалярами R и S (serde не
+/// умеет [u8; 64]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreKeyStoreState {
+    pub version: u32,
+    /// Seed identity (восстанавливается через Identity::from_seed).
+    pub identity_seed: [u8; 32],
+    pub spk_id: u32,
+    pub spk_secret: [u8; 32],
+    pub spk_public: [u8; 32],
+    pub spk_sig_r: [u8; 32],
+    pub spk_sig_s: [u8; 32],
+    /// (key_id, secret) неопубликованных OPK.
+    pub pending: Vec<(u32, [u8; 32])>,
+    /// (key_id, secret) опубликованных, ещё не использованных OPK.
+    pub published: Vec<(u32, [u8; 32])>,
+    /// Tombstone сожжённых OPK: (key_id, used_at_wall_clock).
+    pub used_pre_keys: Vec<(u32, u64)>,
+    pub next_opk_id: u32,
+}
+
 impl PreKeyStore {
     pub fn new(identity: Identity) -> Self {
         PreKeyStore {
@@ -259,6 +282,79 @@ impl PreKeyStore {
         let cutoff = now_millis().saturating_sub(USED_PREKEY_TTL_MS);
         self.used_pre_keys.retain(|_, used_at| *used_at > cutoff);
     }
+
+    /// Экспорт pre-key инфраструктуры (persist, MUSH-B-SPEC §3). Versioned:
+    /// несовпадение version -> import None. Пары OPK несут СЕКРЕТЫ
+    /// (публичные перевычисляются при импорте; иначе published-ключи,
+    /// ожидающие handshake, стали бы мёртвым грузом).
+    pub fn export_state(&self) -> PreKeyStoreState {
+        let secret_pair = |k: &OneTimePreKey| (k.key_id, k.secret.to_bytes());
+        let mut pending: Vec<_> = self.pending.values().map(secret_pair).collect();
+        pending.sort_by_key(|(id, _)| *id);
+        let mut published: Vec<_> = self.published.values().map(secret_pair).collect();
+        published.sort_by_key(|(id, _)| *id);
+        let mut used_pre_keys: Vec<_> = self.used_pre_keys.iter().map(|(k, v)| (*k, *v)).collect();
+        used_pre_keys.sort_by_key(|(id, _)| *id);
+        PreKeyStoreState {
+            version: 1,
+            identity_seed: self.identity.seed(),
+            spk_id: self.spk.key_id,
+            spk_secret: self.spk.secret.to_bytes(),
+            spk_public: self.spk.public,
+            spk_sig_r: self.spk.signature[..32].try_into().expect("sig R half"),
+            spk_sig_s: self.spk.signature[32..].try_into().expect("sig S half"),
+            pending,
+            published,
+            used_pre_keys,
+            next_opk_id: self.next_opk_id,
+        }
+    }
+
+    /// Восстановление pre-key инфраструктуры из persist. Публичные ключи
+    /// SPK/OPK перевычисляются из секретов; SPK сверяется с сохранённым
+    /// public — несовпадение = порча state -> None (MUSH-B-SPEC §3).
+    pub fn import_state(state: &PreKeyStoreState) -> Option<Self> {
+        if state.version != 1 {
+            return None;
+        }
+        let identity = Identity::from_seed(state.identity_seed);
+        let spk_secret = StaticSecret::from(state.spk_secret);
+        if x25519_public(&spk_secret) != state.spk_public {
+            return None;
+        }
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&state.spk_sig_r);
+        signature[32..].copy_from_slice(&state.spk_sig_s);
+        let spk = SignedPreKey {
+            key_id: state.spk_id,
+            secret: spk_secret,
+            public: state.spk_public,
+            signature,
+        };
+        let restore_opk = |(id, secret): &(u32, [u8; 32])| {
+            let secret = StaticSecret::from(*secret);
+            let public = x25519_public(&secret);
+            (
+                *id,
+                OneTimePreKey {
+                    key_id: *id,
+                    secret,
+                    public,
+                },
+            )
+        };
+        let pending: HashMap<u32, OneTimePreKey> = state.pending.iter().map(restore_opk).collect();
+        let published: HashMap<u32, OneTimePreKey> =
+            state.published.iter().map(restore_opk).collect();
+        Some(PreKeyStore {
+            identity,
+            spk,
+            pending,
+            published,
+            used_pre_keys: state.used_pre_keys.iter().cloned().collect(),
+            next_opk_id: state.next_opk_id,
+        })
+    }
 }
 
 /// Потребитель бандлов (initiator). Tombstone использованных OPK —
@@ -300,6 +396,40 @@ impl BundleConsumer {
 impl Default for BundleConsumer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Сериализуемое состояние BundleConsumer (persist, MUSH-B-SPEC §3).
+/// Versioned: несовпадение version -> import None.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleConsumerState {
+    pub version: u32,
+    /// ((spk_id, opk_id), logical_clock использования).
+    pub used: Vec<((u32, Option<u32>), u64)>,
+    pub logical_clock: u64,
+}
+
+impl BundleConsumer {
+    /// Экспорт состояния (идемпотентно, &self).
+    pub fn export_state(&self) -> BundleConsumerState {
+        let mut used: Vec<_> = self.used.iter().map(|(k, v)| (*k, *v)).collect();
+        used.sort_by_key(|(k, _)| *k);
+        BundleConsumerState {
+            version: 1,
+            used,
+            logical_clock: self.logical_clock,
+        }
+    }
+
+    /// Восстановление состояния; version != 1 -> None.
+    pub fn import_state(state: &BundleConsumerState) -> Option<Self> {
+        if state.version != 1 {
+            return None;
+        }
+        Some(BundleConsumer {
+            used: state.used.iter().map(|(k, v)| (*k, *v)).collect(),
+            logical_clock: state.logical_clock,
+        })
     }
 }
 
@@ -1036,6 +1166,79 @@ mod tests {
         assert!(empty_bundle.opk.is_none());
         bob.replenish(1);
         assert!(bob.publish_bundle().opk.is_some());
+    }
+
+    #[test]
+    fn pre_key_store_export_import_roundtrip() {
+        let (mut bob, bob_id) = setup();
+        bob.replenish(5);
+        let _bundle = bob.publish_bundle(); // один OPK ушёл в published
+        let state = bob.export_state();
+        let mut restored = PreKeyStore::import_state(&state).expect("import");
+
+        assert_eq!(restored.identity_pubkey(), bob_id.pubkey_bytes());
+        assert_eq!(restored.signed_pre_key_id(), bob.signed_pre_key_id());
+        assert_eq!(restored.pending_count(), bob.pending_count());
+        assert_eq!(state.published.len(), 1, "один OPK опубликован");
+        assert_eq!(state.pending.len(), 7);
+
+        // Полный цикл: handshake через восстановленный store работает
+        // (OPK-секреты published сохранены).
+        let alice = Identity::generate();
+        let bundle = restored.publish_bundle();
+        let (start, init) = X3dhInitiator::start(&alice, &bundle, b"hi").expect("initiator");
+        let (bob_start, first) = restored.complete_handshake(&init).expect("responder");
+        assert_eq!(first, b"hi");
+        assert_eq!(start.session_id, bob_start.session_id);
+    }
+
+    #[test]
+    fn pre_key_store_import_rejects_bad_version() {
+        let (mut bob, _id) = setup();
+        bob.replenish(2);
+        let mut state = bob.export_state();
+        state.version = 99;
+        assert!(PreKeyStore::import_state(&state).is_none());
+    }
+
+    #[test]
+    fn pre_key_store_import_detects_corrupted_spk() {
+        let (mut bob, _id) = setup();
+        bob.replenish(2);
+        // Порча сохранённого public SPK — сверка с перевычисленным ловит.
+        let mut state = bob.export_state();
+        state.spk_public[0] ^= 1;
+        assert!(PreKeyStore::import_state(&state).is_none());
+        // Порча секрета SPK (байт вне зоны clamping: биты 0..3 байта 0 и
+        // старшие биты байта 31 X25519 обнуляет/устанавливает сам) —
+        // перевычисленный public не совпадёт с сохранённым.
+        let mut state = bob.export_state();
+        state.spk_secret[10] ^= 1;
+        assert!(PreKeyStore::import_state(&state).is_none());
+    }
+
+    #[test]
+    fn bundle_consumer_export_import_roundtrip() {
+        let (mut bob, _id) = setup();
+        let bundle = bob.publish_bundle();
+        let mut consumer = BundleConsumer::new();
+        assert!(consumer.mark_used(&bundle));
+        let state = consumer.export_state();
+        let mut restored = BundleConsumer::import_state(&state).expect("import");
+        assert_eq!(restored.export_state(), state);
+        // Tombstone пережил persist: повтор с тем же бандлом отклоняется.
+        assert!(!restored.mark_used(&bundle));
+    }
+
+    #[test]
+    fn bundle_consumer_import_rejects_bad_version() {
+        let mut consumer = BundleConsumer::new();
+        let (mut bob, _id) = setup();
+        let bundle = bob.publish_bundle();
+        consumer.mark_used(&bundle);
+        let mut state = consumer.export_state();
+        state.version = 7;
+        assert!(BundleConsumer::import_state(&state).is_none());
     }
 
     // ---- Double Ratchet ----

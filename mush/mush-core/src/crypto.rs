@@ -3,7 +3,10 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+pub mod identicon;
 pub mod ratchet;
+pub mod safety;
+pub mod vectors;
 
 /// Derive a 32-byte symmetric key via HKDF-SHA256
 /// (`salt` and `info` exactly as specified by the protocol).
