@@ -81,7 +81,7 @@ Responder не может шифровать до первого входяще�
 
 ## 5. План интеграции (дни 7–10)
 
-1. `transport.rs` — **флаг режима, не переписывание**: `Node.crypto_mode: CryptoMode::{Legacy, Ratchet}` (default Legacy — CLI-smoke и Android не трогаются). CI гоняет оба режима тестами. invite-строка получает поле `pk=` (bundle).
+1. `transport.rs` — **флаг режима, не переписывание**: `Node.crypto_mode: CryptoMode::{Legacy, Ratchet}`. На момент интеграции default — Legacy (CLI-smoke и Android не тронуты); с этапа B default — Ratchet (MUSH-B-SPEC §0), Legacy — deprecated до удаления в этапе C. CI гоняет оба режима тестами. invite-строка получает поле `pk=` (bundle).
 2. Handshake в Ratchet-режиме: X3dhInit вместо legacy SNS (новый тип первого фрейма), bundle из invite; responder — PreKeyStore.
 3. 4 ноды localhost: обмен, разрыв TCP, восстановление сессии из persisted state, out-of-order после восстановления.
 4. FS-проверка: компрометация persisted state после N сообщений не раскрывает первые сообщения.

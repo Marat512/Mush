@@ -4,12 +4,20 @@ set -u
 cd "$(dirname "$0")/.."
 BIN=./target/release/mush-node
 S=/tmp/mush-smoke
+# Первый аргумент: crypto-режим (ratchet|legacy). По умолчанию — дефолт
+# бинаря (ratchet, MUSH-B-SPEC §0). Оба режима гоняются в CI (два шага).
+MODE="${1:-ratchet}"
+case "$MODE" in
+  ratchet|legacy) ;;
+  *) echo "usage: smoke.sh [ratchet|legacy]" >&2; exit 2 ;;
+esac
+CRYPTO_ARGS="--crypto $MODE"
 pkill -f 'mush-node --name' 2>/dev/null
 sleep 0.5
 rm -rf "$S" && mkdir -p "$S"
 
 # Alice lives for the whole scenario (15s).
-( { sleep 15; echo "/quit"; } | "$BIN" --name Alice --port 7878 > "$S/alice.log" 2>&1 ) &
+( { sleep 15; echo "/quit"; } | "$BIN" --name Alice --port 7878 $CRYPTO_ARGS > "$S/alice.log" 2>&1 ) &
 ALICE_PID=$!
 sleep 1.5
 
@@ -28,7 +36,7 @@ echo "invite: ${INVITE:0:80}..."
     echo "/alert"
     sleep 0.3
     echo "/quit"
-  } | "$BIN" --name Bob --port 7879 > "$S/bob.log" 2>&1 ) &
+  } | "$BIN" --name Bob --port 7879 $CRYPTO_ARGS > "$S/bob.log" 2>&1 ) &
 BOB_PID=$!
 
 wait "$BOB_PID" 2>/dev/null

@@ -161,3 +161,7 @@ mod tests {
 pub const TYPE_MANIFEST: u8 = 0x05;
 pub const TYPE_X3DH_INIT: u8 = 0x06;
 pub const TYPE_RATCHET: u8 = 0x07;
+/// Публикация активных decoy-EID пиру (S7). В Legacy decoys едут внутри
+/// handshake-сообщений; в ratchet-режиме — отдельным фреймом после регистрации
+/// пира (паритет поведения двух режимов, MUSH-B-SPEC §0).
+pub const TYPE_DECOY_PUBLISH: u8 = 0x08;

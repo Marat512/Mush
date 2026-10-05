@@ -12,7 +12,7 @@
 - **A'-Android** ([MUSH-A'-ANDROID-SPEC](MUSH-A'-ANDROID-SPEC.md)): JNI-мост (mush-jni), foreground service, hotspot/LAN-fallback, Compose UI (6 экранов + QR ZXing), интеграция на двух физических устройствах (Huawei Y5 2019 + Xiaomi HyperOS). Vendor-протокол испытаний — §6.4 спеки.
 - **Этап A — E2E-криптография** ([mush/docs/MUSH-A-SPEC.md](mush/docs/MUSH-A-SPEC.md)): X3DH + Double Ratchet в `mush-core::crypto::ratchet` (golden vectors, out-of-order, anti-replay, FS-тесты, session persistence), transport dual-mode (`CryptoMode::Legacy | Ratchet`), 4-нодная интеграция с relay-перешифровкой, восстановление после потерь в DTN.
 
-CLI quickstart (legacy-режим, default):
+CLI quickstart (default — ratchet-режим, X3DH + Double Ratchet; `--crypto legacy` — старый SNS-handshake, deprecated до этапа C):
 
 ```
 cd mush
@@ -24,7 +24,7 @@ cargo run --release --bin mush-node -- --name Bob --port 7879 --join mush://<inv
 Команды ноды: `/send /join /invite /contacts /sync /flood /decoy /alert /quit` (см. `/help`).
 
 ```bash
-cargo test --release   # 42 теста: crypto, handshake, CRDT, sensors, 2/3-нодные интеграционные
+cargo test --release   # 81 тест: crypto, ratchet, handshake (два режима), CRDT, sensors, 2/3/4-нодные интеграционные
 bash mush/scripts/smoke.sh  # smoke: два реальных процесса, 6 проверок
 ```
 

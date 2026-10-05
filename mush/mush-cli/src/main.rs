@@ -25,6 +25,11 @@ struct Args {
     /// Invite link to join at startup (mush://...).
     #[arg(long)]
     join: Option<String>,
+
+    /// Crypto protocol: ratchet (default, этап A X3DH+Double Ratchet) or
+    /// legacy (SNS handshake; deprecated, жив до этапа C — MUSH-B-SPEC §0).
+    #[arg(long, default_value = "ratchet")]
+    crypto: String,
 }
 
 #[tokio::main]
@@ -38,7 +43,16 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let node = Arc::new(Mutex::new(Node::new(&args.name, args.port)));
+    let mut node = Node::new(&args.name, args.port);
+    match args.crypto.as_str() {
+        "ratchet" => node.set_crypto_mode(mush_core::transport::CryptoMode::Ratchet),
+        "legacy" => node.set_crypto_mode(mush_core::transport::CryptoMode::Legacy),
+        other => {
+            eprintln!("[FATAL] unknown --crypto value: {other} (expected ratchet|legacy)");
+            std::process::exit(2);
+        }
+    }
+    let node = Arc::new(Mutex::new(node));
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
 
     // Startup join (--join mush://...).

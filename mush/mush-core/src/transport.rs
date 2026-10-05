@@ -13,7 +13,8 @@ use crate::base64;
 use crate::crdt::{hex, AdHocGroup, ChatMessage, GroupId, PubKey};
 use crate::crypto::ratchet;
 use crate::framing::{
-    self, Frame, TYPE_DECOY, TYPE_HANDSHAKE, TYPE_RATCHET, TYPE_SYNC, TYPE_TEXT, TYPE_X3DH_INIT,
+    self, Frame, TYPE_DECOY, TYPE_DECOY_PUBLISH, TYPE_HANDSHAKE, TYPE_RATCHET, TYPE_SYNC,
+    TYPE_TEXT, TYPE_X3DH_INIT,
 };
 use crate::identity::Identity;
 use crate::sensors::{
@@ -59,6 +60,11 @@ pub struct Invite {
     pub group_key: [u8; 32],
     /// base64(CBOR(PreKeyBundle)) — small manifest, ≤512 символов.
     pub pk: Option<String>,
+    /// Отображаемое имя владельца invite (base64 в render). Неаутентифицировано
+    /// (invite — сам доверенный носитель через QR); нужно ratchet-пути, где
+    /// у initiator'а иначе нет способа узнать имя responder'а — Legacy-путь
+    /// получает имя из подписанного handshake-reply и это поле игнорирует.
+    pub name: Option<String>,
 }
 
 impl Invite {
@@ -71,9 +77,13 @@ impl Invite {
             base64::encode(&self.group_id),
             base64::encode(&self.group_key),
         );
-        match &self.pk {
+        let with_pk = match &self.pk {
             Some(pk) => format!("{base}&pk={pk}"),
             None => base,
+        };
+        match &self.name {
+            Some(name) => format!("{}&name={}", with_pk, base64::encode(name.as_bytes())),
+            None => with_pk,
         }
     }
 
@@ -96,6 +106,7 @@ impl Invite {
         let mut addr = None;
         let mut group = None;
         let mut pk = None;
+        let mut name = None;
         for part in query.split('&') {
             let Some((key, val)) = part.split_once('=') else {
                 continue;
@@ -110,6 +121,10 @@ impl Invite {
                 }
                 "addr" => addr = Some(val.to_string()),
                 "pk" => pk = Some(val.to_string()),
+                "name" => {
+                    let bytes = base64::decode(val).ok_or("bad name base64")?;
+                    name = Some(String::from_utf8(bytes).map_err(|_| "name not utf-8")?);
+                }
                 "group" => {
                     let (gid_b64, gkey_b64) = val.split_once('-').ok_or("bad group part")?;
                     let gid = base64::decode(gid_b64).ok_or("bad group id base64")?;
@@ -134,6 +149,7 @@ impl Invite {
             group_id,
             group_key,
             pk,
+            name,
         })
     }
 }
@@ -182,6 +198,14 @@ pub struct DecoyPayload {
     pub destination: [u8; 32],
 }
 
+/// Публикация активных decoy-EID (0x08): ratchet-путь заменяет decoy-поле
+/// SNS handshake. Принимающая сторона кладёт список в `Peer.decoys` —
+/// /decoy работает в обоих режимах.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecoyPublishPayload {
+    pub decoys: Vec<[u8; 32]>,
+}
+
 /// Node state + behavior (CLI-SPEC §2.1). One node = one process.
 pub struct Node {
     identity: Identity,
@@ -208,8 +232,9 @@ pub struct Node {
     /// Optional push-event sink (see `NodeEvent`). Set by embedders; the CLI
     /// and tests leave it unset.
     event_sink: Option<mpsc::UnboundedSender<NodeEvent>>,
-    /// Этап A: протокол рукопожатия/сообщений. Default Legacy — CLI-smoke и
-    /// Android не тронуты; Ratchet включается явно (MUSH-A-SPEC §5).
+    /// Этап A: протокол рукопожатия/сообщений. Default Ratchet — основной
+    /// режим с этапа B (MUSH-B-SPEC §0: Legacy deprecated, жив до этапа C);
+    /// Legacy включается явно через `set_crypto_mode` / CLI `--crypto legacy`.
     crypto_mode: CryptoMode,
     /// Этап A: pre-keys (SPK + OPK) для ratchet-режима.
     pre_key_store: ratchet::PreKeyStore,
@@ -233,7 +258,7 @@ impl Node {
     pub fn new(name: &str, port: u16) -> Node {
         let identity = Identity::generate();
         let me = identity.pubkey_bytes();
-        Node {
+        let mut node = Node {
             identity: identity.clone(),
             name: name.to_string(),
             configured_port: port,
@@ -252,11 +277,17 @@ impl Node {
             idle_flush: Duration::from_secs(1),
             self_ref: None,
             event_sink: None,
-            crypto_mode: CryptoMode::Legacy,
+            crypto_mode: CryptoMode::Ratchet,
             pre_key_store: ratchet::PreKeyStore::new(identity),
             bundle_consumer: ratchet::BundleConsumer::new(),
             activation_enabled: true,
+        };
+        // Дефолт — Ratchet: узел сразу готов к X3DH (очередь OPK пополнена
+        // до того же уровня, что и при `set_crypto_mode(Ratchet)`).
+        if node.pre_key_store.pending_count() < 50 {
+            node.pre_key_store.replenish(50);
         }
+        node
     }
 
     /// Этап A (тесты): включить/выключить немедленную активацию после join.
@@ -376,6 +407,7 @@ impl Node {
             group_id: group.group_id,
             group_key: group.group_key,
             pk,
+            name: Some(self.name.clone()),
         }
         .render()
     }
@@ -546,10 +578,16 @@ impl Node {
                 }
             }
             let peer_key = bundle.identity;
+            // Имя responder'а — из invite (поле `name=`; неаутентифицировано,
+            // но invite и есть доверенный носитель — QR). Fallback — short key.
+            let owner_name = invite
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::sensors::short_key(&peer_key));
             self.contacts.insert(
                 peer_key,
                 Contact {
-                    name: crate::sensors::short_key(&peer_key),
+                    name: owner_name.clone(),
                     last_seen: Some(Instant::now()),
                 },
             );
@@ -560,7 +598,7 @@ impl Node {
                 peer_key,
                 Peer {
                     writer,
-                    name: crate::sensors::short_key(&peer_key),
+                    name: owner_name.clone(),
                     decoys: Vec::new(),
                     session_key: [0u8; 32],
                     group_id: invite.group_id,
@@ -575,6 +613,20 @@ impl Node {
             tokio::spawn(async move {
                 Node::outbound_loop(me, peer_key, reader).await;
             });
+            // Parity с Legacy-путём: handshake-completion виден в логах и
+            // событиях на обеих сторонах (MUSH-B-SPEC §0: ratchet — основной
+            // режим, smoke и JNI-тесты завязаны на эти строки).
+            self.emit(NodeEvent::HandshakeComplete {
+                peer: peer_key,
+                name: owner_name.clone(),
+            });
+            tracing::info!(
+                "Handshake complete with {} ({}). Session key established.",
+                owner_name,
+                crate::sensors::short_key(&peer_key),
+            );
+            tracing::info!("Group joined: {}", Self::group_label(&invite.group_id));
+            self.publish_decoys_to(&peer_key).await;
             // Активация: первое ratchet-сообщение (пустой текст) владельцу —
             // без него responder-сторона не может шифровать (send-цепочка
             // строится из DH с ratchet-ключом initiator'а). При потере в DTN
@@ -830,12 +882,30 @@ impl Node {
                     self.push_alert(alert);
                 }
             }
+            TYPE_DECOY_PUBLISH => {
+                let Ok(published) = frame.decode::<DecoyPublishPayload>() else {
+                    return;
+                };
+                if let Some(peer) = self.peers.get_mut(conn) {
+                    peer.decoys = published.decoys;
+                }
+            }
             other => {
                 tracing::warn!(
                     "unexpected frame type {other:#04x} from {}",
                     crate::sensors::short_key(conn)
                 );
             }
+        }
+    }
+
+    /// Опубликовать свои активные decoy-EID пиру (S7). В Legacy decoys едут
+    /// внутри handshake-сообщений; в ratchet-режиме — фреймом 0x08 сразу
+    /// после регистрации пира, с обеих сторон.
+    async fn publish_decoys_to(&mut self, peer: &PubKey) {
+        let decoys = self.s7.active_decoys().to_vec();
+        if let Ok(frame) = Frame::typed(TYPE_DECOY_PUBLISH, &DecoyPublishPayload { decoys }) {
+            self.send_to(peer, &frame).await;
         }
     }
 
@@ -1258,7 +1328,7 @@ impl Node {
                     peer_key,
                     Peer {
                         writer,
-                        name: peer_name,
+                        name: peer_name.clone(),
                         decoys: Vec::new(),
                         session_key: [0u8; 32],
                         group_id,
@@ -1274,6 +1344,19 @@ impl Node {
                         .map(|p| p.name.clone())
                         .unwrap_or_default(),
                 });
+                // Parity с Legacy `register_peer`: handshake-completion виден
+                // в логах (smoke, Logcat) на обеих сторонах.
+                tracing::info!(
+                    "Handshake complete with {} ({}). Session key established.",
+                    peer_name,
+                    crate::sensors::short_key(&peer_key),
+                );
+            }
+            // S7: отдаём initiator'у свои decoy-EID (в Legacy это поле
+            // handshake-reply; здесь — фрейм 0x08).
+            {
+                let mut n = node.lock().await;
+                n.publish_decoys_to(&peer_key).await;
             }
             loop {
                 match framing::read_frame(&mut reader).await {
@@ -1461,8 +1544,12 @@ pub async fn run(
 mod tests {
     use super::*;
 
+    /// A'-era helper: явный Legacy-режим. Эти тесты — регрессия Legacy до
+    /// его удаления в этапе C (MUSH-B-SPEC §0); дефолт узла с этапа B —
+    /// Ratchet (`test_node_default` / `start_node_mode(.., Ratchet)`).
     pub(crate) fn test_node(name: &str) -> Arc<Mutex<Node>> {
         let mut node = Node::new(name, 0);
+        node.set_crypto_mode(CryptoMode::Legacy);
         node.flush_every = Duration::from_millis(50);
         node.idle_flush = Duration::from_millis(100);
         Arc::new(Mutex::new(node))
@@ -1499,6 +1586,15 @@ mod tests {
         });
         let invite = rx.await.expect("invite");
         (node, invite)
+    }
+
+    /// Инвариант этапа B (MUSH-B-SPEC §0): дефолт Node::new — Ratchet,
+    /// узел сразу готов к X3DH (OPK-очередь пополнена).
+    #[test]
+    fn default_crypto_mode_is_ratchet() {
+        let node = Node::new("default", 0);
+        assert_eq!(node.crypto_mode(), CryptoMode::Ratchet);
+        assert!(node.pre_key_store.pending_count() >= 50);
     }
 
     pub(crate) async fn cmd(node: &Arc<Mutex<Node>>, line: &str) {
@@ -1761,6 +1857,60 @@ mod ratchet_mode_tests {
     //! транспорта (MUSH-A-SPEC §5). Legacy-режим не тронут — dual-mode CI.
     use super::tests::*;
     use super::*;
+
+    /// S7 в ratchet-режиме: decoy-EID публикуются фреймом 0x08 (в Legacy —
+    /// полем handshake), /decoy противника взводит алёрт на владельце EID.
+    #[tokio::test]
+    async fn ratchet_mode_decoy_publish_and_s7_alert() {
+        let (a, invite_a) = start_node_mode("alice", CryptoMode::Ratchet).await;
+        let (b, _invite_b) = start_node_mode("bob", CryptoMode::Ratchet).await;
+        cmd(&b, &format!("/join {invite_a}")).await;
+        wait_for(
+            || async { b.lock().await.peer_count() == 1 && a.lock().await.peer_count() == 1 },
+            3000,
+            "peers connected",
+        )
+        .await;
+        // Decoy-обмен состоялся в обе стороны.
+        wait_for(
+            || async {
+                !b.lock()
+                    .await
+                    .peers
+                    .values()
+                    .next()
+                    .unwrap()
+                    .decoys
+                    .is_empty()
+                    && !a
+                        .lock()
+                        .await
+                        .peers
+                        .values()
+                        .next()
+                        .unwrap()
+                        .decoys
+                        .is_empty()
+            },
+            3000,
+            "decoy publish both ways",
+        )
+        .await;
+
+        cmd(&b, "/decoy").await;
+        wait_for(
+            || async {
+                a.lock()
+                    .await
+                    .alert_strings()
+                    .iter()
+                    .any(|s| s.contains("S7 Alert"))
+            },
+            3000,
+            "s7 alert on a",
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn ratchet_mode_two_nodes_exchange() {
