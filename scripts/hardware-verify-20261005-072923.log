@@ -1,0 +1,67 @@
+hardware-check artifact 2026-10-05T07:29:23+03:00
+OWNER=emulator-5554 CLIENT=emulator-5554 ABI/устройства: List of devices attached;emulator-5554	device;;
+APK=/c/Projects/Mush/scripts/../mush/mush-android/app/build/outputs/apk/debug/app-debug.apk wait=18s pubkey_pattern='pubkey: ' session_pattern='session: '
+
+== Сводка ==
+[PASS] OWNER ABI (x86_64) — эмулятор: репетиция, на железе будет arm*
+[PASS] CLIENT ABI (x86_64) — эмулятор: репетиция, на железе будет arm*
+[PASS] APK существует — app-debug.apk
+[PASS] install (loopback)
+[PASS] install (loopback)
+[PASS] prefs seed OWNER (emulator-5554)
+[PASS] prefs seed CLIENT (emulator-5554)
+[PASS] am start emulator-5554
+[PASS] am start emulator-5554
+[PASS] OWNER: лог собран — 6 строк
+[PASS] OWNER: node created
+[PASS] OWNER: listener started
+[MANUAL] OWNER: pubkey в логе — паттерн 'pubkey: ' не найден (переопредели HW_PUBKEY_PATTERN); возьми pubkey из UI/Native.pubkey
+[PASS] CLIENT: лог собран — 6 строк
+[PASS] CLIENT: node created
+[PASS] CLIENT: listener started
+[MANUAL] CLIENT: pubkey в логе — паттерн 'pubkey: ' не найден (переопредели HW_PUBKEY_PATTERN); возьми pubkey из UI/Native.pubkey
+[MANUAL] session ID совпадает на обеих сторонах — паттерн 'session: ' не на обеих сторонах; сверь short-id в debug-поле Contacts (§6.3)
+[PASS] loopback: без FATAL/AndroidRuntime
+[PASS] loopback: без FATAL/AndroidRuntime
+
+PASS=17 FAIL=0 MANUAL=3
+
+== Логи устройств (mush:V AndroidRuntime:E) ==
+---- loopback ----
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963
+---- loopback ----
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963
+--------- beginning of main
+--------- beginning of system
+--------- beginning of kernel
+10-05 04:29:07.363 12734 12778 I mush    : mush_jni::node: mush-jni: node created
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: node state imported
+10-05 04:29:07.368 12734 12778 I mush    : mush_jni::node: mush-jni: listener started on 127.0.0.1:43963

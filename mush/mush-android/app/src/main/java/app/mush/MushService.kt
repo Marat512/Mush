@@ -34,10 +34,30 @@ class MushService : Service() {
     private var myPubkey: String = ""
     private var lamportSeq = 0L
 
+    /** Этап B: внутренняя persistence узла (MUSH-B-SPEC §1). Это НЕ
+     * user-facing Backup: флаг «export/import только явное действие» (§4)
+     * про бэкап в файл — здесь throttled-автосохранение состояния ноды
+     * (identity seed + pre-keys + сессии) в Vault той же логики касается. */
+    private var vault: VaultManager? = null
+
+    /** Throttle автосохранения: не чаще раза в 10 секунд (§7 дни 4–5). */
+    private var lastVaultSaveMs = 0L
+    private fun saveNodeStateThrottled(force: Boolean = false) {
+        val h = handle
+        val v = vault ?: return
+        if (h == 0L) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastVaultSaveMs < 10_000) return
+        lastVaultSaveMs = now
+        // exportState — чистый снапшот (&self, идемпотентен); пишем мимо UI.
+        runCatching { v.saveNodeState(Native.exportState(h)) }
+    }
+
     /** Service-owned callback (§5.3). Rust держит GlobalRef на этот объект
      * до shutdown; Activity сюда не попадает. */
     private val callback = object : MushCallback {
         override fun onMessage(groupId: String, senderPubkey: String, text: String, ts: Long) {
+            saveNodeStateThrottled()
             MushStore.update { s ->
                 val name = s.contacts.firstOrNull { it.pubkey == senderPubkey }?.name
                     ?: senderPubkey.take(8)
@@ -70,6 +90,7 @@ class MushService : Service() {
         }
 
         override fun onHandshakeComplete(peerPubkey: String) {
+            saveNodeStateThrottled()
             MushStore.update { s ->
                 val known = s.contacts.any { it.pubkey == peerPubkey }
                 s.copy(
@@ -112,7 +133,12 @@ class MushService : Service() {
             it.copy(phase = NodePhase.Starting, statusLine = "Creating identity…")
         }
         try {
+            // Этап B: Vault открываем до ноды — restore state возможен только
+            // до старта (importState заменяет ноду, §4 контракт «только на
+            // остановленной» соблюдён: нода ещё не запущена).
+            vault = VaultManager.open(this)
             val h = Native.init(filesDir.absolutePath, callback)
+            val restored = vault?.loadNodeState()?.takeIf { Native.importState(h, it) }
             // Этап A: Android всегда ratchet-режим (X3DH + Double Ratchet),
             // до startListener — иначе пользователи получили бы legacy E2E.
             Native.setCryptoMode(h, 1)
@@ -124,12 +150,18 @@ class MushService : Service() {
             MushStore.update {
                 it.copy(
                     phase = NodePhase.Running,
-                    statusLine = "Node started on port $port",
+                    statusLine = if (restored != null) {
+                        "Node restored from Vault on port $port"
+                    } else {
+                        "Node started on port $port"
+                    },
                     myPubkey = pubkey,
                     myName = name,
                     invite = Native.invite(h),
                 )
             }
+            // Сразу после первого старта — начальный снапшот в Vault.
+            saveNodeStateThrottled(force = true)
             bringUpNetwork(port)
         } catch (t: Throwable) {
             MushStore.update {
@@ -238,9 +270,13 @@ class MushService : Service() {
         MushStore.commandSink = null
         NetworkManager.stopHotspot()
         if (handle != 0L) {
+            // Финальный снапшот до shutdown: после него handle мёртв.
+            saveNodeStateThrottled(force = true)
             runCatching { Native.shutdown(handle) }
             handle = 0
         }
+        vault?.close()
+        vault = null
         MushStore.update { it.copy(phase = NodePhase.Stopped, statusLine = "Node stopped") }
         super.onDestroy()
     }

@@ -41,5 +41,13 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.navigation:navigation-compose:2.8.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // Этап B (MUSH-B-SPEC §1.1): SQLCipher bundled AAR. Версия фиксируется
+    // нами (не ОС); ABI-набор AAR (arm64-v8a/armeabi-v7a/x86_64) совпадает
+    // с libmush_jni.so. 4.17.0 — последняя с minCompileSdk ≤ 34: 4.18.0+
+    // требует compileSdk 37 (проект на 34, AGP 8.6.1).
+    implementation("net.zetetic:sqlcipher-android:4.17.0")
+    // SQLCipher 4.17+ ссылается на androidx.sqlite-типы в сигнатурах API.
+    implementation("androidx.sqlite:sqlite:2.4.0")
+    testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
