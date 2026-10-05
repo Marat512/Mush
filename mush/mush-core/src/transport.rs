@@ -2229,9 +2229,12 @@ mod ratchet_mode_tests {
         let state = b.lock().await.export_state();
         let mut cbor = Vec::new();
         ciborium::ser::into_writer(&state, &mut cbor).expect("cbor");
+        // Soft limit 1 MB, НЕ invariant (MUSH-B-SPEC §1.3): сессии ≈ 2–8 KB
+        // каждая, при 10+ контактах 64 KB пробивается — 1 MB с запасом.
+        // Превышение = повод для streaming export в следующей версии формата.
         assert!(
-            cbor.len() < 64 * 1024,
-            "NodeState {} bytes >= 64 KB потолка",
+            cbor.len() < 1024 * 1024,
+            "NodeState {} bytes >= 1 MB soft limit",
             cbor.len()
         );
         let decoded: NodeState = ciborium::de::from_reader(cbor.as_slice()).expect("cbor decode");

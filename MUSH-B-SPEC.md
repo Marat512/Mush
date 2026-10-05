@@ -53,6 +53,27 @@
 
 Sensors/alerts/inbox — эфемерны (вне Vault, как сейчас).
 
+**Размер NodeState CBOR — soft limit 1 MB, не invariant.** Первоначальная
+оценка «< 64 KB» была на глаз с одним контактом: каждая ratchet-сессия ≈ 2–8 KB
+(root + chains + skipped + seen), при 10+ контактах сессии дают 20–80 KB, плюс
+100 OPK, плюс seed. 1 MB — с запасом, binder-транзакции к этому не привязаны
+(экспорт — явный user-action в файл, не IPC). Превышение — повод для streaming
+export в следующей версии формата, не для отказа.
+
+### 1.2.1 Keystore failure modes (специфицировано до кода)
+
+| Сценарий | Что происходит | UX-flow |
+|----------|----------------|---------|
+| Пользователь сменил PIN/паттерн устройства | Hardware-backed Keystore может инвалидировать ключ (зависит от TEE) | При отказе unwrap DEK: «Устройство заблокировало ключ хранилища. Восстановите из резервной копии (Backup) или создайте новую идентичность». Кнопки: «Импорт бэкапа» / «Новая идентичность» (второе — с явным предупреждением, что контакты не восстановятся без бэкапа) |
+| Биометрия обновлена (новый палец/лицо) | На B DEK не привязан к biometric (KeyGenParameterSpec без user auth) — ключ НЕ должен инвалидироваться. Если вендор инвалидирует — это баг вендора: тот же flow, что при смене PIN | Диагностика в протоколе испытаний (§6): залогировать факт инвалидации на каждом устройстве |
+| Устройство потеряно/сброшено | Keystore и DEK недоступны; у пользователя — exportState-CBOR (бэкап, §3 флаг 3) | Recovery = «Импорт бэкапа»: importState(bytes) → identity + pre-keys + сессии восстановлены. Без бэкапа — только новая идентичность (E2E-архитектура: сервера восстановления нет, это честное ограничение, показать в onboarding) |
+| Приложение переустановлено | Keystore-entry Android < 6... на практике: Keystore НЕ app-scoped, ключ может пережить переустановку, а `filesDir` — нет → обёртка потеряна | Если unwrap DEK невозможен после reinstall — тот же recovery-flow. Проверить на §6: сохранился ли ключ после `adb uninstall` на каждом вендоре (зафиксировать факт, не кодить под него) |
+| Keystore недоступен/без hardware (Xiaomi/Huawei) | `KeyStoreException`/`ProviderException` на генерации | Fallback: software-KEK (AES-256 в файле, защищённом правами FS) + честный баннер в UI «устройство без аппаратного хранилища — ключ в защищённом файле». Не молчаливая потеря, не краш (см. §8) |
+
+Принцип: любой отказ unwrap DEK никогда не приводит к молчаливой потере
+identity и никогда не крашит процесс — всегда один из двух путей:
+«Импорт бэкапа» или «Новая идентичность» (с предупреждением).
+
 ### 1.4 Схема БД (v1)
 
 ```sql
@@ -114,7 +135,16 @@ Verified-флаг хранится в памяти процесса (потер�
 3. **Эмулятор:** onboarding → отправить/получить → force-stop → запуск: тот же pubkey, сессии живы (reconnect без re-handshake), история на месте.
 4. **CI:** rust tests + `./gradlew test` (Robolectric) + assembleDebug.
 
-## 6. Hardware verification (Pixel/Samsung — ПЕРЕД Stage B кодом)
+## 6. Hardware verification (Pixel/Samsung)
+
+**Scope гейта (уточнён): применяется к Keystore-интеграции, НЕ к Vault-коду вообще.**
+Vault ортогонален Ratchet: Vault хранит state, Ratchet шифрует сообщения.
+Поэтому **пишется параллельно без телефонов**: Vault-скелет + SQLCipher-схема v1
++ миграция MushService на Vault-хранение тестируются на эмуляторе. Гейт
+блокирует только **Keystore-обёртку DEK** (§1.2) — hardware-backed Keystore на
+EMUI vs HyperOS vs AOSP ведёт себя по-разному, это проверяется только на
+реальных устройствах. Прогон чеклиста — `scripts/hardware-check.sh`
+(автоматический harness, не ad-hoc).
 
 **Gap, закрываемый первым: ratchet-APK на железе не проверен.** Чеклист:
 
@@ -125,20 +155,22 @@ Verified-флаг хранится в памяти процесса (потер�
 5. Latency X3DH на Huawei Y5 2019: замер в debug-build (`SystemClock.elapsedRealtime` вокруг join), цель < 1.5 c; при превышении — прогресс-индикатор в UI onboarding-join.
 6. Persistence на железе: restart приложения → pubkey тот же (только после реализации §4; до неё — зафиксировать в протоколе испытаний, что identity эфемерна).
 
-**Не начинать Stage B код до зелёного чеклиста №1–3.**
+**Не начинать Keystore-обёртку DEK до зелёного чеклиста №1–3. Vault-скелет,
+SQLCipher и миграция — без гейта.**
 
 ## 7. Порядок работ (B)
 
 | День | Работа |
 |------|--------|
-| 1 | §0: default=Ratchet в CLI (коммит-переключатель), legacy-тесты → ratchet |
-| 2 | mush-core: identicon + safety_number + golden vectors (Rust) |
-| 3 | mush-core: PreKeyStore/Node export-import + Identity::from_seed |
-| 4–5 | Android: SQLCipher AAR, VaultManager (Keystore wrap), схема v1 |
-| 6 | Kotlin identicon (golden == Rust) + UI (Onboarding/Contacts) |
-| 7 | Safety Number UI + JNI export/import |
+| 1 | §0: default=Ratchet в CLI (коммит-переключатель), legacy-тесты → ratchet ✅ |
+| 2 | mush-core: identicon + safety_number + golden vectors (Rust) ✅ |
+| 3 | mush-core: PreKeyStore/Node export-import + Identity::from_seed + JNI-экспорт ✅ |
+| 3.5 | `scripts/hardware-check.sh` — автоматический harness §6 (два устройства, install, QR-проверка, session ID, /send, логи в файл) |
+| 4–5 | Android: SQLCipher AAR, VaultManager-скелет (**plaintext DEK, Keystore — TODO после §6**), схема v1, миграция MushService на Vault-хранение |
+| 6 | Kotlin identicon (golden == Rust через identiconBytes) + UI (Onboarding/Contacts) |
+| 7 | Safety Number UI (**после persistence contacts — иначе Verified теряется при рестарте; UI раньше Vault = генератор багов**) |
 | 8 | Эмуляторные интеграционные (restart-persistence) |
-| 9–10 | Буфер: hardware-чеклист §6 при приезде телефонов, баги |
+| 9–10 | Буфер: hardware-чеклист §6 при приезде телефонов (**Keystore-обёртка DEK заменяет plaintext**), баги |
 
 ## 8. Риски
 
