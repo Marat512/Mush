@@ -41,6 +41,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.navigation:navigation-compose:2.8.0")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    // Этап B день 6 (MUSH-B-SPEC §2): идентикон — Coil + SvgDecoder, НЕ
+    // WebView, НЕ Compose Canvas (Rust — единственный источник правды рендеринга).
+    implementation("io.coil-kt:coil-compose:2.6.0")
+    implementation("io.coil-kt:coil-svg:2.6.0")
     // Этап B (MUSH-B-SPEC §1.1): SQLCipher bundled AAR. Версия фиксируется
     // нами (не ОС); ABI-набор AAR (arm64-v8a/armeabi-v7a/x86_64) совпадает
     // с libmush_jni.so. 4.17.0 — последняя с minCompileSdk ≤ 34: 4.18.0+

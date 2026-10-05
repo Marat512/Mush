@@ -27,7 +27,7 @@ data class ChatMessage(
     val mine: Boolean,
 )
 
-data class Contact(val pubkey: String, val name: String, val connected: Boolean)
+data class Contact(val pubkey: String, val name: String, val connected: Boolean, val verified: Boolean = false)
 
 data class AlertItem(
     val id: String,
@@ -53,6 +53,12 @@ sealed interface NodeCommand {
     data class SendMessage(val text: String) : NodeCommand
     data class Join(val invite: String) : NodeCommand
     data class DismissAlert(val id: String) : NodeCommand
+    /** Этап B (§3.1): «Совпадает» на экране сверки safety number —
+     *  контакт получает Verified (persist в Vault). */
+    data class MarkVerified(val pubkey: String) : NodeCommand
+    /** Этап B (флаг 4): Onboarding записал имя — поднимаем listener/сеть.
+     *  Identity (handle) существует к этому моменту, см. MushService.initNode. */
+    data object StartNetworking : NodeCommand
     // Debug hooks (§10, критерии 6/7): триггерят S1/S7 вручную.
     data class DebugFlood(val n: Int) : NodeCommand
     data object DebugDecoy : NodeCommand

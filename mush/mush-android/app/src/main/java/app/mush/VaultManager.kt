@@ -167,6 +167,45 @@ class VaultManager private constructor(
         }
     }
 
+    /** Контакт из Vault (загрузка при старте, MUSH-B-SPEC §1.3/§3.1). */
+    data class StoredContact(
+        val pubkey: ByteArray,
+        val name: String,
+        val trust: TrustLevel,
+    )
+
+    /** Добавить контакт, если его ещё нет (handshake не затирает имя,
+     *  заданное пользователем, и не сбрасывает trust). */
+    @Synchronized
+    fun addContactIfAbsent(pubkey: ByteArray, name: String) {
+        db.execSQL(
+            "INSERT OR IGNORE INTO ${VaultSchema.TABLE_CONTACTS}(pubkey, name, trust_level) VALUES(?, ?, ?)",
+            arrayOf(pubkey, name, TrustLevel.UNVERIFIED.toDbValue()),
+        )
+    }
+
+    /** Все контакты (для восстановления списка после рестарта). */
+    @Synchronized
+    fun contacts(): List<StoredContact> {
+        val out = mutableListOf<StoredContact>()
+        val cursor = db.rawQuery(
+            "SELECT pubkey, name, trust_level FROM ${VaultSchema.TABLE_CONTACTS} ORDER BY name",
+            null,
+        ) ?: return out
+        cursor.use {
+            while (it.moveToNext()) {
+                out.add(
+                    StoredContact(
+                        pubkey = it.getBlob(0),
+                        name = it.getString(1),
+                        trust = TrustLevel.fromDbValue(it.getString(2)),
+                    ),
+                )
+            }
+        }
+        return out
+    }
+
     @Synchronized
     fun addMessage(groupId: ByteArray, sender: ByteArray, lamport: Long, text: String, createdAt: Long) {
         db.execSQL(

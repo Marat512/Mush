@@ -33,6 +33,8 @@ class MushService : Service() {
     private var handle: Long = 0
     private var myPubkey: String = ""
     private var lamportSeq = 0L
+    /** Listener/сеть подняты (StartNetworking от Onboarding/autoStart). */
+    private var networkingStarted = false
 
     /** Этап B: внутренняя persistence узла (MUSH-B-SPEC §1). Это НЕ
      * user-facing Backup: флаг «export/import только явное действие» (§4)
@@ -105,6 +107,14 @@ class MushService : Service() {
                     },
                 )
             }
+            // Контакт persist в Vault (§1.3): переживает рестарт. Имя/trust
+            // не трогаем — verified ставит только сверка safety number (§3.1).
+            runCatching {
+                vault?.addContactIfAbsent(
+                    android.util.Base64.decode(peerPubkey, android.util.Base64.DEFAULT),
+                    peerPubkey.take(8),
+                )
+            }
             updateNotification("Peer connected")
         }
 
@@ -123,44 +133,87 @@ class MushService : Service() {
         createChannel()
         startForegroundWithType()
         if (handle == 0L) {
-            Thread { startNode() }.start()
+            // Флаг 4 (день 6): identity создаётся ЗДЕСЬ, при старте сервиса —
+            // до Onboarding. Splash ждёт myPubkey в MushStore, Onboarding
+            // только пишет имя и дёргает StartNetworking.
+            Thread { initNode() }.start()
         }
         return START_STICKY
     }
 
-    private fun startNode() {
+    /** Identity + Vault restore. Без listener: сеть поднимается по
+     *  StartNetworking (после Onboarding), контракты соблюдены: importState
+     *  и setCryptoMode — до startListener, нода ещё не запущена. */
+    private fun initNode() {
         MushStore.update {
             it.copy(phase = NodePhase.Starting, statusLine = "Creating identity…")
         }
         try {
-            // Этап B: Vault открываем до ноды — restore state возможен только
-            // до старта (importState заменяет ноду, §4 контракт «только на
-            // остановленной» соблюдён: нода ещё не запущена).
+            // Vault открываем до ноды — restore возможен только до старта
+            // (importState заменяет ноду, §4 контракт «только на остановленной»).
             vault = VaultManager.open(this)
             val h = Native.init(filesDir.absolutePath, callback)
             val restored = vault?.loadNodeState()?.takeIf { Native.importState(h, it) }
-            // Этап A: Android всегда ratchet-режим (X3DH + Double Ratchet),
-            // до startListener — иначе пользователи получили бы legacy E2E.
+            // Android всегда ratchet-режим (X3DH + Double Ratchet) — до
+            // startListener, иначе пользователи получили бы legacy E2E.
             Native.setCryptoMode(h, 1)
             val pubkey = Native.pubkey(h)
-            val port = Native.startListener(h, 0)
             handle = h
             myPubkey = pubkey
-            val name = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_NAME, "") ?: ""
+            restoreContacts()
+            MushStore.update {
+                it.copy(
+                    phase = NodePhase.Starting, // listener ещё не поднят
+                    statusLine = if (restored != null) {
+                        "Identity restored from Vault"
+                    } else {
+                        "Identity created"
+                    },
+                    myPubkey = pubkey,
+                    myName = prefsName(),
+                )
+            }
+        } catch (t: Throwable) {
+            MushStore.update {
+                it.copy(phase = NodePhase.Error, statusLine = "Error: ${t.message}")
+            }
+        }
+    }
+
+    /** Контакты из Vault в MushStore (§1.3): trust_level дочитывается
+     *  реальный, не дефолт — иначе Verified терялся бы при рестарте. */
+    private fun restoreContacts() {
+        val stored = vault?.contacts() ?: return
+        val b64 = stored.map {
+            app.mush.ui.Contact(
+                pubkey = android.util.Base64.encodeToString(it.pubkey, android.util.Base64.DEFAULT),
+                name = it.name,
+                connected = false, // connected — runtime-состояние, не persist
+                verified = it.trust == TrustLevel.VERIFIED,
+            )
+        }
+        MushStore.update { s -> s.copy(contacts = b64) }
+    }
+
+    private fun prefsName(): String =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_NAME, "") ?: ""
+
+    /** Listener + hotspot/LAN + invite. Вызывается по StartNetworking. */
+    private fun startNetworking() {
+        val h = handle
+        if (h == 0L || networkingStarted) return
+        networkingStarted = true
+        try {
+            val port = Native.startListener(h, 0)
             MushStore.update {
                 it.copy(
                     phase = NodePhase.Running,
-                    statusLine = if (restored != null) {
-                        "Node restored from Vault on port $port"
-                    } else {
-                        "Node started on port $port"
-                    },
-                    myPubkey = pubkey,
-                    myName = name,
+                    statusLine = "Node started on port $port",
+                    myName = prefsName(),
                     invite = Native.invite(h),
                 )
             }
-            // Сразу после первого старта — начальный снапшот в Vault.
+            // Начальный снапшот в Vault после подъёма listener.
             saveNodeStateThrottled(force = true)
             bringUpNetwork(port)
         } catch (t: Throwable) {
@@ -209,7 +262,42 @@ class MushService : Service() {
     }
 
     private fun handleCommand(cmd: NodeCommand) {
-        if (handle == 0L) return
+        when (cmd) {
+            // StartNetworking — до handle (identity ещё создаётся): стартуем
+            // сервис (initNode отработает) и дожидаемся — polling короткий.
+            NodeCommand.StartNetworking -> {
+                startForegroundService(Intent(this, MushService::class.java))
+                Thread {
+                    val deadline = System.currentTimeMillis() + 15_000
+                    while (handle == 0L && System.currentTimeMillis() < deadline) {
+                        Thread.sleep(100)
+                    }
+                    startNetworking()
+                }.start()
+            }
+            is NodeCommand.MarkVerified -> {
+                val s = MushStore.state.value
+                val contact = s.contacts.firstOrNull { it.pubkey == cmd.pubkey } ?: return
+                val bytes = android.util.Base64.decode(cmd.pubkey, android.util.Base64.DEFAULT)
+                runCatching {
+                    vault?.upsertContact(bytes, contact.name, TrustLevel.VERIFIED)
+                }
+                MushStore.update { st ->
+                    st.copy(
+                        contacts = st.contacts.map {
+                            if (it.pubkey == cmd.pubkey) it.copy(verified = true) else it
+                        },
+                    )
+                }
+            }
+            else -> {
+                if (handle == 0L) return
+                handleNodeCommand(cmd)
+            }
+        }
+    }
+
+    private fun handleNodeCommand(cmd: NodeCommand) {
         when (cmd) {
             is NodeCommand.SendMessage -> {
                 // Локальное эхо (callback Rust шлёт только входящие).
@@ -232,6 +320,9 @@ class MushService : Service() {
             is NodeCommand.DismissAlert -> MushStore.update { s ->
                 s.copy(alerts = s.alerts.filterNot { it.id == cmd.id })
             }
+            // MarkVerified/StartNetworking разбираются в handleCommand выше.
+            is NodeCommand.MarkVerified -> Unit
+            NodeCommand.StartNetworking -> Unit
             is NodeCommand.DebugFlood -> Native.flood(handle, cmd.n)
             NodeCommand.DebugDecoy -> Native.decoy(handle)
         }

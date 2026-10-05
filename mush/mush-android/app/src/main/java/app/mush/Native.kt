@@ -16,7 +16,11 @@ interface MushCallback {
  * main thread. */
 object Native {
     init {
-        System.loadLibrary("mush_jni")
+        // Ленивая загрузка: Android грузит "mush_jni" из APK-jniLibs, JVM-тесты
+        // (IdenticonGoldenTest) — конкретный файл через System.load ДО первого
+        // вызова (путь из env MUSH_JNI_LIB). runCatching: в JVM-тесте
+        // loadLibrary упадёт — это допустимо, пока тест сам подгрузил либу.
+        runCatching { System.loadLibrary("mush_jni") }
     }
 
     external fun init(dataDir: String, callback: MushCallback): Long

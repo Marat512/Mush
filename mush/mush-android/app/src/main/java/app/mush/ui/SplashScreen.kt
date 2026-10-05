@@ -11,17 +11,29 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 
-/** Splash (§8.1): логотип + spinner, «Создаём ключ…».
- *  Задержка короткая — реальная работа (Rust init) идёт в сервисе позже. */
+/** Splash (§8.1). Флаг 4 (день 6): identity обязана существовать К ОНЦУ
+ *  Splash — ждём myPubkey в MushStore (сервис стартует из MainActivity
+ *  сразу, initNode идёт в фоне), а не фиксированный таймаут. Onboarding
+ *  после этого показывает ТОТ ЖЕ идентикон при любом возврате/отмене. */
 @Composable
 fun SplashScreen(onTimeout: () -> Unit) {
+    val state by MushStore.state.collectAsState()
     LaunchedEffect(Unit) {
-        delay(1200)
+        // Страховка от вечного спиннера: initNode сам переведёт фазу в Error
+        // при сбое — тогда тоже уходим (Onboarding покажет статус-строку).
+        val deadline = System.currentTimeMillis() + 20_000
+        while (state.myPubkey.isEmpty() && state.phase != NodePhase.Error &&
+            System.currentTimeMillis() < deadline
+        ) {
+            delay(100)
+        }
         onTimeout()
     }
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

@@ -35,6 +35,7 @@ import app.mush.ui.AlertsScreen
 import app.mush.ui.ChatsScreen
 import app.mush.ui.ChatScreen
 import app.mush.ui.ContactsScreen
+import app.mush.ui.MushStore
 import app.mush.ui.MushViewModel
 import app.mush.ui.NodeCommand
 import app.mush.ui.NodePhase
@@ -61,6 +62,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Флаг 4 (день 6): сервис (и identity) стартует ДО Onboarding —
+        // сразу при открытии приложения. Splash ждёт myPubkey.
+        startService()
         setContent {
             MaterialTheme {
                 Surface {
@@ -69,7 +73,6 @@ class MainActivity : ComponentActivity() {
                         requestPermissions = {
                             permissionLauncher.launch(Permissions.requestSet())
                         },
-                        startService = { startService() },
                         saveName = { name(it) },
                     )
                 }
@@ -93,19 +96,12 @@ class MainActivity : ComponentActivity() {
 fun AppNav(
     hasName: Boolean,
     requestPermissions: () -> Unit,
-    startService: () -> Unit,
     saveName: (String) -> Unit,
 ) {
     val nav = rememberNavController()
     var showQr by rememberSaveable { mutableStateOf(false) }
     var scanQr by rememberSaveable { mutableStateOf(false) }
     val viewModel: MushViewModel = viewModel()
-
-    // Автостарт ноды при входе в main-экраны: сервис не переживает
-    // force-stop/reinstall, иначе UI показывал бы "Node not started" вечно.
-    val autoStart: () -> Unit = {
-        if (viewModel.state.value.phase == NodePhase.Stopped) startService()
-    }
 
     NavHost(navController = nav, startDestination = "splash") {
         composable("splash") {
@@ -118,11 +114,22 @@ fun AppNav(
         composable("onboarding") {
             OnboardingScreen(onDone = { name ->
                 saveName(name)
+                // Сеть поднимается только после имени; identity уже есть.
+                MushStore.send(NodeCommand.StartNetworking)
                 requestPermissions()
                 nav.navigate("chats") { popUpTo("onboarding") { inclusive = true } }
             })
         }
-        composable("chats") { androidx.compose.runtime.LaunchedEffect(Unit) { autoStart() }; MainScaffold(viewModel, nav, { showQr = true }, { scanQr = true }) }
+        composable("chats") {
+            // Возвращающийся пользователь (имя есть): Splash -> chats, сервис
+            // уже стартовал в onCreate — здесь только сеть, если ещё не поднята.
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                if (viewModel.state.value.phase == NodePhase.Starting) {
+                    MushStore.send(NodeCommand.StartNetworking)
+                }
+            }
+            MainScaffold(viewModel, nav, { showQr = true }, { scanQr = true })
+        }
         composable("chat") {
             ChatScreen(viewModel, onBack = { nav.popBackStack() })
         }
