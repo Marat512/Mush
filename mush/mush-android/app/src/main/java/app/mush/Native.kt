@@ -32,5 +32,24 @@ object Native {
     external fun decoy(handle: Long): Boolean
     // Этап A: 0 = Legacy, 1 = Ratchet. Android всегда 1 (§13).
     external fun setCryptoMode(handle: Long, mode: Int)
+
+    // --- Этап B (MUSH-B-SPEC §3) ---
+    // Handle-free: идентикон/safety number рисуются ДО старта ноды
+    // (onboarding, сверка ключей) — handle не нужен. Вход — base64(pubkey),
+    // как у [pubkey]. Rust — единственный источник правды рендеринга:
+    // Kotlin не рендерит идентикон из bytes для UI (bytes — только
+    // golden-vector сверка Rust↔Kotlin). Невалидный base64/длина != 32
+    // бросают IllegalArgumentException.
+    external fun identiconSvg(pubkey: String): String
+    external fun identiconBytes(pubkey: String): ByteArray
+    external fun safetyNumber(a: String, b: String): String
+
+    // Явный Backup/Transfer состояния ноды — ТОЛЬКО user-action, НЕ
+    // onPause/onStop. exportState работает и на свежей ноде (seed+pre-keys).
+    // importState ЗАМЕНЯЕТ ноду за handle: вызывать ТОЛЬКО на остановленной
+    // ноде (задачи старой обрываются). Невалидный CBOR/version mismatch ->
+    // false, не exception — Kotlin решает (fallback на новую identity).
+    external fun exportState(handle: Long): ByteArray
+    external fun importState(handle: Long, bytes: ByteArray): Boolean
     external fun shutdown(handle: Long)
 }

@@ -81,6 +81,26 @@ Responder не может шифровать до первого входяще�
 
 ## 5. План интеграции (дни 7–10)
 
+### 5.0 Протокольные добавления (день 1 этапа B, коммит e1c77be)
+
+Смена дефолта на Ratchet вскрыла три пробела протокола — закрыты расширением,
+не обходом. Зафиксировано здесь, чтобы не раскапывать потом по git-истории:
+
+1. **invite: поле `name=`** (base64 UTF-8) — отображаемое имя владельца.
+   Причина: в ratchet-пути у initiator'а нет источника имени responder'а
+   (в Legacy — подписанный handshake-reply). Неаутентифицировано, но invite и
+   есть доверенный носитель (QR). Legacy-путь поле игнорирует. Парсинг tolerant:
+   старые invite без `name=` валидны (fallback — short key).
+2. **Фрейм 0x08 DecoyPublish** — публикация активных decoy-EID пиру сразу после
+   регистрации, с обеих сторон. Причина: в Legacy decoys едут полями
+   handshake-сообщений, в ratchet возить их было нечем — без 0x08 `/decoy` и
+   сенсор S7 не работали бы в ratchet-режиме. Payload: `{decoys: Vec<[u8;32]>}`,
+   принимающая сторона кладёт в `Peer.decoys`.
+3. **Паритет handshake-completion**: `NodeEvent::HandshakeComplete` и лог
+   «Handshake complete with … Session key established.» теперь на **обеих**
+   сторонах в обоих режимах (раньше в ratchet-пути initiator-сторона молчала —
+   JNI acceptance и Android-события зависли бы).
+
 1. `transport.rs` — **флаг режима, не переписывание**: `Node.crypto_mode: CryptoMode::{Legacy, Ratchet}`. На момент интеграции default — Legacy (CLI-smoke и Android не тронуты); с этапа B default — Ratchet (MUSH-B-SPEC §0), Legacy — deprecated до удаления в этапе C. CI гоняет оба режима тестами. invite-строка получает поле `pk=` (bundle).
 2. Handshake в Ratchet-режиме: X3dhInit вместо legacy SNS (новый тип первого фрейма), bundle из invite; responder — PreKeyStore.
 3. 4 ноды localhost: обмен, разрыв TCP, восстановление сессии из persisted state, out-of-order после восстановления.

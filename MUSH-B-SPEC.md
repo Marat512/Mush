@@ -78,8 +78,21 @@ CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB);  -- sessions, prekey store, identit
 - Вход: `SHA-256(min(IK_A,IK_B) || max(IK_A,IK_B))` — сортировка устраняет зависимость от порядка сторон (протокольное правило, не UI).
 - Представление: 60 десятичных цифр, 12 групп по 5 (как Signal) — читаемость вслух, привычный паттерн.
 - Вычисление в `mush-core` (`pub fn safety_number(ik_a, ik_b) -> String`), golden vectors; Android получает через JNI.
-- UI B: экран контакта → «Сверить Safety Number»: 60 цифр + идентиконы обеих сторон. Сверка голосом/встречей — вне B (QR-SAS — этап C).
 - Записывается также в MUSH-PROTOCOL.md (это протокол, не UI).
+
+### 3.1 UX-протокол сверки (зафиксирован до кода UI)
+
+| Шаг | Поведение |
+|-----|-----------|
+| Вход | Contact → «Сверить с <имя>» |
+| Экран | Modal: safety number, 60 цифр, 12 групп по 5, monospace + идентиконы обеих сторон |
+| Каналы | Кнопки «Скопировать» / «Поделиться» — для сверки по голосовому/третьему каналу |
+| Совпадение | Чекбокс «Совпадает» → trust level контакта = Verified (persist в Vault) |
+| Несовпадение | Предупреждение «Ключ изменился с прошлого раза» + ручное подтверждение; без Verified отправка не блокируется (A'-модель доверия), но баннер остаётся |
+
+Сверка голосом/встречей — вне B (QR-SAS — этап C). До реализации Vault
+Verified-флаг хранится в памяти процесса (потеря при перезапуске допустима
+в B-прототипе).
 
 ## 4. Новая поверхность mush-core / JNI (scope B)
 
@@ -87,10 +100,11 @@ CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB);  -- sessions, prekey store, identit
 |---------|-----|-------|
 | `Identity::from_seed([u8;32])` + `Identity::seed()` | identity.rs | персист identity (сейчас только OsRng) |
 | `PreKeyStore::export_state/import_state` (versioned) | crypto::ratchet | персист OPK/SPK (иначе рестарт ломает бандлы) |
-| `Node::export_node_state/import_node_state` (identity+prekeys+sessions) | transport.rs | атомарный снапшот Vault |
+| `Node::export_state/import_state` (NodeState v1: identity+prekeys+sessions+contacts) | transport.rs | атомарный снапшот persistence |
 | `crypto::identicon` + golden vectors | новый модуль | §2 |
 | `safety_number(ik_a, ik_b)` + golden vectors | crypto | §3 |
-| JNI: `Native.exportState(handle)->byte[]`, `Native.importState(handle, bytes)` | mush-jni | Vault roundtrip |
+| JNI (handle-free, чистые функции от pubkey): `identiconSvg(pubkey)->String`, `identiconBytes(pubkey)->[u8;10]`, `safetyNumber(pkA, pkB)->String` | mush-jni | §2/§3; без ноды — UI может рисовать до старта ноды; **Rust — единственный источник правды для рендеринга** (SVG для UI, bytes — для golden-vector сверки) |
+| JNI: `Native.exportState(handle)->byte[]` (CBOR NodeState), `Native.importState(handle, bytes)` — **только явный user-action** (Backup / Transfer), не на lifecycle; Kotlin пишет bytes в файл/Vault | mush-jni | persistence identity+prekeys+sessions (не Vault: chat history + contacts в SQLCipher — дни 4+, отдельные JNI-функции) |
 | Kotlin: VaultManager (Keystore wrap, SQLCipher open, migrations) | app | §1 |
 
 ## 5. Тест-план (без телефонов)
@@ -155,9 +169,14 @@ Safety number (MUSH-B-SPEC §3, реализация `mush-core::crypto::safety`
 - `combined(A,B) = SHA-256(min(IK_A,IK_B) ‖ max(IK_A,IK_B))` — лексикографический
   порядок по сырым байтам Ed25519-ключей (симметрия: одна строка у обеих сторон).
 - Строка: первые **30 байт** свёртки, каждый байт → две десятичные цифры
-  `(b % 100) / 10, b % 10` (младшие две цифры; для b < 100 это b/10, b%10 —
-  отступление от первоначальной формулировки ТЗ, где байты ≥100 давали не-цифры;
-  семантика совпадает с Signal `byte % 100`), формат **12 групп по 5 цифр** через пробел.
+  `(b % 100) / 10, b % 10` (младшие две цифры десятичной записи байта) —
+  формат **12 групп по 5 цифр** через пробел.
+
+**Важно: изначальная ТЗ-формула `b / 10, b % 10` была багом** — для байтов
+≥ 100 она даёт значения 10..25, т.е. не цифры. Реализованная формула —
+правильная (семантика Signal `byte % 100`; для b < 100 обе формулы совпадают).
+Это не «отступление от ТЗ», это исправление ТЗ; возврат к старой формуле
+ломает формат-тесты и несовместим с golden vectors.
 
 ## Приложение B. Golden vectors
 

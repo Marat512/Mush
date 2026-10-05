@@ -234,6 +234,45 @@ pub async unsafe fn node_send(
     Ok(true)
 }
 
+/// Этап B: экспорт состояния ноды в CBOR (MUSH-B-SPEC §3). Работает и на
+/// свежей ноде (экспортирует seed + pre-keys). Только явный user-action
+/// (Backup/Transfer) — не onPause/onStop.
+pub async unsafe fn node_export_state(handle: *mut JniNode) -> Result<Vec<u8>, String> {
+    let node = &*handle;
+    let state = node.node.lock().await.export_state();
+    let mut cbor = Vec::new();
+    ciborium::ser::into_writer(&state, &mut cbor).map_err(|e| format!("cbor encode: {e}"))?;
+    Ok(cbor)
+}
+
+/// Этап B: замена ноды за handle из CBOR-состояния (MUSH-B-SPEC §3).
+/// ВНИМАНИЕ: вызывать ТОЛЬКО на остановленной ноде — задачи слушателя
+/// старой ноды обрываются, dispatcher пересоздаётся на новой. Ошибки
+/// (невалидный CBOR, version mismatch, порча вложенного state) -> Ok(false),
+/// не exception: Kotlin решает сам (например, fallback на новую identity).
+pub async unsafe fn node_import_state(handle: *mut JniNode, bytes: &[u8]) -> Result<bool, String> {
+    let node = &mut *handle;
+    let Ok(state) = ciborium::de::from_reader::<mush_core::transport::NodeState, _>(bytes) else {
+        return Ok(false);
+    };
+    let Some(mut imported) = mush_core::transport::Node::import_state(&state) else {
+        return Ok(false);
+    };
+    // Старая нода уходит: обрываем её задачи (слушатель, flush, dispatcher).
+    for task in node.tasks.drain(..) {
+        task.abort();
+    }
+    // Новая нода на месте старой: канал событий + dispatcher заново,
+    // sink и data_dir сохраняются (handle для Kotlin не меняется).
+    let (tx, rx) = mpsc::unbounded_channel::<NodeEvent>();
+    imported.set_event_sink(tx);
+    node.node = Arc::new(Mutex::new(imported));
+    node.tasks.push(spawn_dispatcher(rx, node.sink.clone()));
+    node.bound = false;
+    tracing::info!("mush-jni: node state imported");
+    Ok(true)
+}
+
 /// Reclaim the node: abort spawned tasks, drop the sink (releases the Kotlin
 /// GlobalRef). The handle must not be used afterwards.
 pub unsafe fn node_shutdown(handle: *mut JniNode) {
@@ -370,6 +409,109 @@ mod tests {
             let a = node_init("", sink).expect("init");
             let ok = unsafe { node_connect(a, "127.0.0.1", 1) }.unwrap(); // port 1: closed
             assert!(!ok);
+            unsafe { node_shutdown(a) };
+        });
+    }
+
+    // ---- Этап B: export/import состояния (MUSH-B-SPEC §3) ----
+
+    /// «Убийство процесса»: export -> байты (имитация записи в файл) ->
+    /// import в свежую ноду -> identity/pubkey совпадают, pre-key store
+    /// восстановлен (повторный export идентичен по содержимому).
+    #[test]
+    fn export_import_roundtrip_preserves_identity_and_prekeys() {
+        runtime().block_on(async {
+            let sink = Arc::new(RecordingSink::default());
+            let a = node_init("", sink).expect("init");
+            let pubkey_before = unsafe { node_pubkey(a).await }.unwrap();
+            let cbor = unsafe { node_export_state(a) }.await.expect("export");
+            unsafe { node_shutdown(a) };
+
+            // Новая нода — как будто процесс перезапустился.
+            let sink2 = Arc::new(RecordingSink::default());
+            let b = node_init("", sink2).expect("init 2");
+            assert_ne!(
+                unsafe { node_pubkey(b).await }.unwrap(),
+                pubkey_before,
+                "до import — другая identity"
+            );
+            assert!(unsafe { node_import_state(b, &cbor) }.await.unwrap());
+
+            assert_eq!(
+                unsafe { node_pubkey(b).await }.unwrap(),
+                pubkey_before,
+                "после import — исходный pubkey"
+            );
+            // Повторный export совпадает побайтово: seed, pre-keys, OPK-очередь
+            // (used tombstones с wall-clock-таймстемпами в этом тесте пусты).
+            let cbor2 = unsafe { node_export_state(b) }.await.expect("re-export");
+            assert_eq!(cbor, cbor2, "export после import должен быть идентичен");
+            unsafe { node_shutdown(b) };
+        });
+    }
+
+    /// Идентикон и safety number от восстановленной identity совпадают
+    /// с исходными — ловит дрейф export/import на уровне UI-функций.
+    #[test]
+    fn export_import_preserves_identicon_and_safety_number() {
+        runtime().block_on(async {
+            let sink = Arc::new(RecordingSink::default());
+            let a = node_init("", sink).expect("init");
+            let sink_b = Arc::new(RecordingSink::default());
+            let b = node_init("", sink_b).expect("init b");
+            let pk_a = unsafe { node_pubkey(a).await }.unwrap();
+            let pk_b = unsafe { node_pubkey(b).await }.unwrap();
+            let icon_before = crate::pure::identicon_svg(&pk_a).unwrap();
+            let safety_before = crate::pure::safety_number(&pk_a, &pk_b).unwrap();
+            let cbor_a = unsafe { node_export_state(a) }.await.expect("export a");
+            let cbor_b = unsafe { node_export_state(b) }.await.expect("export b");
+            unsafe { node_shutdown(a) };
+            unsafe { node_shutdown(b) };
+
+            let sink2 = Arc::new(RecordingSink::default());
+            let a2 = node_init("", sink2).expect("init 2");
+            let sink2b = Arc::new(RecordingSink::default());
+            let b2 = node_init("", sink2b).expect("init 2b");
+            assert!(unsafe { node_import_state(a2, &cbor_a) }.await.unwrap());
+            assert!(unsafe { node_import_state(b2, &cbor_b) }.await.unwrap());
+
+            let pk_a2 = unsafe { node_pubkey(a2).await }.unwrap();
+            let pk_b2 = unsafe { node_pubkey(b2).await }.unwrap();
+            assert_eq!(crate::pure::identicon_svg(&pk_a2).unwrap(), icon_before);
+            assert_eq!(
+                crate::pure::safety_number(&pk_a2, &pk_b2).unwrap(),
+                safety_before
+            );
+            unsafe { node_shutdown(a2) };
+            unsafe { node_shutdown(b2) };
+        });
+    }
+
+    #[test]
+    fn import_rejects_garbage_and_keeps_node() {
+        runtime().block_on(async {
+            let sink = Arc::new(RecordingSink::default());
+            let a = node_init("", sink).expect("init");
+            let pubkey_before = unsafe { node_pubkey(a).await }.unwrap();
+            // Мусор — false, нода не тронута.
+            assert!(!unsafe { node_import_state(a, b"\xde\xad\xbe\xef") }
+                .await
+                .unwrap());
+            // Валидный CBOR, но version mismatch — тоже false.
+            let mut state = {
+                let cbor = unsafe { node_export_state(a) }.await.expect("export");
+                ciborium::de::from_reader::<mush_core::transport::NodeState, _>(cbor.as_slice())
+                    .expect("decode")
+            };
+            state.version = 99;
+            let mut bad = Vec::new();
+            ciborium::ser::into_writer(&state, &mut bad).expect("encode");
+            assert!(!unsafe { node_import_state(a, &bad) }.await.unwrap());
+            assert_eq!(
+                unsafe { node_pubkey(a).await }.unwrap(),
+                pubkey_before,
+                "нода осталась прежней"
+            );
             unsafe { node_shutdown(a) };
         });
     }

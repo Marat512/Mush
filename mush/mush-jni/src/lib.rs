@@ -10,21 +10,24 @@
 mod callback;
 mod errors;
 mod node;
+mod pure;
 mod runtime;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use callback::{EventSink, KotlinCallback};
-use errors::throw;
+use errors::{throw, throw_illegal_argument};
 use node::{
-    node_connect, node_decoy, node_flood, node_init, node_invite, node_join, node_pubkey,
-    node_send, node_set_advertised_addr, node_set_crypto_mode, node_shutdown, node_start_listener,
+    node_connect, node_decoy, node_export_state, node_flood, node_import_state, node_init,
+    node_invite, node_join, node_pubkey, node_send, node_set_advertised_addr, node_set_crypto_mode,
+    node_shutdown, node_start_listener,
 };
+use pure::{identicon_bytes, identicon_svg, safety_number};
 use runtime::runtime;
 
 /// Install a logcat writer for `tracing` events on Android (MS0: Rust logs
@@ -375,5 +378,158 @@ pub extern "C" fn Java_app_mush_Native_shutdown(mut env: JNIEnv, _class: JClass,
         throw(&mut env, &e);
     } else if result.is_err() {
         throw(&mut env, "Rust panic in Native.shutdown");
+    }
+}
+
+/// jbyteArray из среза; при нехватке памяти JVM — null + исключение.
+fn to_jbyte_array(env: &mut JNIEnv, bytes: &[u8]) -> jni::sys::jbyteArray {
+    match env.byte_array_from_slice(bytes) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => {
+            throw(env, "byte_array_from_slice failed");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Этап B (MUSH-B-SPEC §3): handle-free UI-функции. Идентикон/safety number
+// рисуются ДО старта ноды (onboarding, сверка ключей) — handle не нужен.
+// Rust — единственный источник правды рендеринга: Kotlin не рендерит
+// идентикон из bytes для UI (bytes — только golden-vector сверка).
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_identiconSvg(
+    mut env: JNIEnv,
+    _class: JClass,
+    pubkey_b64: JString,
+) -> jstring {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<String, String> {
+        let pk = get_string(&mut env, &pubkey_b64)?;
+        identicon_svg(&pk)
+    }));
+    match result {
+        Ok(Ok(s)) => to_jstring(&mut env, s),
+        Ok(Err(e)) => {
+            throw_illegal_argument(&mut env, &e);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.identiconSvg");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_identiconBytes(
+    mut env: JNIEnv,
+    _class: JClass,
+    pubkey_b64: JString,
+) -> jni::sys::jbyteArray {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
+        let pk = get_string(&mut env, &pubkey_b64)?;
+        identicon_bytes(&pk)
+    }));
+    match result {
+        Ok(Ok(bytes)) => to_jbyte_array(&mut env, &bytes),
+        Ok(Err(e)) => {
+            throw_illegal_argument(&mut env, &e);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.identiconBytes");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_safetyNumber(
+    mut env: JNIEnv,
+    _class: JClass,
+    pk_a_b64: JString,
+    pk_b_b64: JString,
+) -> jstring {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<String, String> {
+        let a = get_string(&mut env, &pk_a_b64)?;
+        let b = get_string(&mut env, &pk_b_b64)?;
+        safety_number(&a, &b)
+    }));
+    match result {
+        Ok(Ok(s)) => to_jstring(&mut env, s),
+        Ok(Err(e)) => {
+            throw_illegal_argument(&mut env, &e);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.safetyNumber");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Этап B (MUSH-B-SPEC §3): явный Backup/Transfer состояния ноды.
+// ТОЛЬКО user-action — не onPause/onStop. importState заменяет ноду за
+// handle: вызывать ТОЛЬКО на остановленной ноде (задачи старой обрываются).
+// Невалидный CBOR/version mismatch -> false, не exception (Kotlin решает:
+// fallback на новую identity).
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_exportState(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jbyteArray {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        runtime().block_on(unsafe { node_export_state(handle as *mut node::JniNode) })
+    }));
+    match result {
+        Ok(Ok(bytes)) => to_jbyte_array(&mut env, &bytes),
+        Ok(Err(e)) => {
+            throw(&mut env, &e);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.exportState");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_app_mush_Native_importState(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    bytes: JByteArray,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<jboolean, String> {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        let bytes = env
+            .convert_byte_array(&bytes)
+            .map_err(|e| format!("bad byte array: {e}"))?;
+        let ok = runtime()
+            .block_on(unsafe { node_import_state(handle as *mut node::JniNode, &bytes) })?;
+        Ok(ok as jboolean)
+    }));
+    match result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            throw(&mut env, &e);
+            0
+        }
+        Err(_) => {
+            throw(&mut env, "Rust panic in Native.importState");
+            0
+        }
     }
 }

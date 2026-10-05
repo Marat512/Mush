@@ -679,6 +679,7 @@ dependencies = [
 name = "mush-jni"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "jni",
  "mush-core",
  "once_cell",

@@ -7,3 +7,10 @@ use jni::JNIEnv;
 pub fn throw(env: &mut JNIEnv, msg: &str) {
     let _ = env.throw_new("java/lang/RuntimeException", msg);
 }
+
+/// Throw `java/lang/IllegalArgumentException` — для handle-free функций
+/// (MUSH-B-SPEC §3): невалидный base64/pubkey в identicon/safety number
+/// это ошибка вызывающего кода, а не ноды.
+pub fn throw_illegal_argument(env: &mut JNIEnv, msg: &str) {
+    let _ = env.throw_new("java/lang/IllegalArgumentException", msg);
+}
