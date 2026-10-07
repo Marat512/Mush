@@ -143,15 +143,26 @@ class MushService : Service() {
 
     /** Identity + Vault restore. Без listener: сеть поднимается по
      *  StartNetworking (после Onboarding), контракты соблюдены: importState
-     *  и setCryptoMode — до startListener, нода ещё не запущена. */
+     *  и setCryptoMode — до startListener, нода ещё не запущена.
+     *
+     *  Отказ Vault (DekError: dek.bin порчен/Keystore недоступен) — НЕ краш:
+     *  нода живёт в памяти без persistence (как A'), statusLine честно
+     *  сообщает. Временное поведение до UX-flow «Импорт бэкапа/Новая
+     *  идентичность» (MUSH-B-SPEC §1.2.1). */
     private fun initNode() {
         MushStore.update {
             it.copy(phase = NodePhase.Starting, statusLine = "Creating identity…")
         }
+        var vaultError: String? = null
+        vault = try {
+            VaultManager.open(this)
+        } catch (e: DekError) {
+            // Граница Result — VaultManager: сюда доходит уже DekError.
+            android.util.Log.e("MushService", "Vault недоступен: ${e.message}", e)
+            vaultError = e.message
+            null
+        }
         try {
-            // Vault открываем до ноды — restore возможен только до старта
-            // (importState заменяет ноду, §4 контракт «только на остановленной»).
-            vault = VaultManager.open(this)
             val h = Native.init(filesDir.absolutePath, callback)
             val restored = vault?.loadNodeState()?.takeIf { Native.importState(h, it) }
             // Android всегда ratchet-режим (X3DH + Double Ratchet) — до
@@ -164,10 +175,11 @@ class MushService : Service() {
             MushStore.update {
                 it.copy(
                     phase = NodePhase.Starting, // listener ещё не поднят
-                    statusLine = if (restored != null) {
-                        "Identity restored from Vault"
-                    } else {
-                        "Identity created"
+                    statusLine = when {
+                        vaultError != null ->
+                            "Vault недоступен: $vaultError — identity эфемерна до восстановления"
+                        restored != null -> "Identity restored from Vault"
+                        else -> "Identity created"
                     },
                     myPubkey = pubkey,
                     myName = prefsName(),
@@ -180,8 +192,8 @@ class MushService : Service() {
         }
     }
 
-    /** Контакты из Vault в MushStore (§1.3): trust_level дочитывается
-     *  реальный, не дефолт — иначе Verified терялся бы при рестарте. */
+    /** Контакты из Vault в MushStore (§1.3/§3.2): trust_level дочитывается
+     *  реальный (verified | verification_failed), не дефолт. */
     private fun restoreContacts() {
         val stored = vault?.contacts() ?: return
         val b64 = stored.map {
@@ -189,7 +201,11 @@ class MushService : Service() {
                 pubkey = android.util.Base64.encodeToString(it.pubkey, android.util.Base64.DEFAULT),
                 name = it.name,
                 connected = false, // connected — runtime-состояние, не persist
-                verified = it.trust == TrustLevel.VERIFIED,
+                trust = when (it.trust) {
+                    TrustLevel.VERIFIED -> app.mush.ui.UiTrust.VERIFIED
+                    TrustLevel.VERIFICATION_FAILED -> app.mush.ui.UiTrust.FAILED
+                    TrustLevel.UNVERIFIED -> app.mush.ui.UiTrust.UNVERIFIED
+                },
             )
         }
         MushStore.update { s -> s.copy(contacts = b64) }
@@ -275,17 +291,24 @@ class MushService : Service() {
                     startNetworking()
                 }.start()
             }
-            is NodeCommand.MarkVerified -> {
+            is NodeCommand.SetTrust -> {
                 val s = MushStore.state.value
                 val contact = s.contacts.firstOrNull { it.pubkey == cmd.pubkey } ?: return
                 val bytes = android.util.Base64.decode(cmd.pubkey, android.util.Base64.DEFAULT)
+                val vaultLevel = when (cmd.trust) {
+                    app.mush.ui.UiTrust.VERIFIED -> TrustLevel.VERIFIED
+                    app.mush.ui.UiTrust.FAILED -> TrustLevel.VERIFICATION_FAILED
+                    app.mush.ui.UiTrust.UNVERIFIED -> TrustLevel.UNVERIFIED
+                }
+                // Vault может быть недоступен (DekError): галочка живёт в
+                // MushStore до рестарта, persist пропускаем молча (§1.2.1).
                 runCatching {
-                    vault?.upsertContact(bytes, contact.name, TrustLevel.VERIFIED)
+                    vault?.upsertContact(bytes, contact.name, vaultLevel)
                 }
                 MushStore.update { st ->
                     st.copy(
                         contacts = st.contacts.map {
-                            if (it.pubkey == cmd.pubkey) it.copy(verified = true) else it
+                            if (it.pubkey == cmd.pubkey) it.copy(trust = cmd.trust) else it
                         },
                     )
                 }
@@ -320,8 +343,8 @@ class MushService : Service() {
             is NodeCommand.DismissAlert -> MushStore.update { s ->
                 s.copy(alerts = s.alerts.filterNot { it.id == cmd.id })
             }
-            // MarkVerified/StartNetworking разбираются в handleCommand выше.
-            is NodeCommand.MarkVerified -> Unit
+            // SetTrust/StartNetworking разбираются в handleCommand выше.
+            is NodeCommand.SetTrust -> Unit
             NodeCommand.StartNetworking -> Unit
             is NodeCommand.DebugFlood -> Native.flood(handle, cmd.n)
             NodeCommand.DebugDecoy -> Native.decoy(handle)

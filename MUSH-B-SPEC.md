@@ -108,12 +108,37 @@ CREATE TABLE kv(k TEXT PRIMARY KEY, v BLOB);  -- sessions, prekey store, identit
 | Вход | Contact → «Сверить с <имя>» |
 | Экран | Modal: safety number, 60 цифр, 12 групп по 5, monospace + идентиконы обеих сторон |
 | Каналы | Кнопки «Скопировать» / «Поделиться» — для сверки по голосовому/третьему каналу |
-| Совпадение | Чекбокс «Совпадает» → trust level контакта = Verified (persist в Vault) |
-| Несовпадение | Предупреждение «Ключ изменился с прошлого раза» + ручное подтверждение; без Verified отправка не блокируется (A'-модель доверия), но баннер остаётся |
+| Совпадение | Кнопка «Совпадает» → trust_level = Verified (persist в Vault, переживает рестарт) |
+| Несовпадение | Кнопка «Не совпадает» → trust_level = **VerificationFailed** (красный индикатор в списке, в sheet — «предыдущая сверка: не совпало»); отправка не блокируется, но с предупреждением; контакт остаётся подозрительным, пока пользователь явно не пересверит |
 
-Сверка голосом/встречей — вне B (QR-SAS — этап C). До реализации Vault
-Verified-флаг хранится в памяти процесса (потеря при перезапуске допустима
-в B-прототипе).
+Сверка голосом/встречей — вне B (QR-SAS — этап C). Verified-флаг persist в
+Vault (SQLCipher), переживает рестарт.
+
+### 3.2 Семантика verification (зафиксировано до демо)
+
+- **Verification односторонняя, локальная.** Alice верифицирует Bob'а → VERIFIED
+  только в Vault Alice. Пир НЕ узнаёт о том, что его верифицировали: никакого
+  handshake-фрейма «verification accepted» в B нет (симметричная verification —
+  как в Signal — требует протокольной доработки, не этап B). На демо, если
+  спросят «почему у Боба не горит verified» — это ожидаемо: verification не
+  транслируется пиру.
+- **Key change = новый контакт, не сброс старого.** Pubkey — первичный ключ
+  контакта. Peer переустановил приложение без бэкапа → новый pubkey →
+  появляется «unknown contact»; старый контакт (verified) остаётся со старым
+  fingerprint и больше не отвечает. Связь — только заново через QR (в Signal
+  это решает телефонная книга — у нас её нет). Это **ограничение модели,
+  не баг**.
+  Если peer переустановил приложение и потерял старый pubkey, у получателя
+  появляется новый unknown contact. Автоматической связи со старым контактом
+  нет. Recovery — только через повторный QR-обмен (и exportState-бэкап у
+  переустановившей стороны, §3 флаг 3).
+- **Re-handshake сохраняет verification.** Имя контакта — из свежего handshake,
+  trust_level и verified_at — сохраняются (verification не сбрасывается при
+  повторном подключении; тест: handshake → verify → re-handshake → Verified
+  остался).
+- TrustLevel: `unverified | verified | verification_failed`. VerificationFailed
+  ставится только явным действием пользователя («не совпадает»), снимается
+  только явной повторной сверкой.
 
 ## 4. Новая поверхность mush-core / JNI (scope B)
 
@@ -169,7 +194,7 @@ SQLCipher и миграция — без гейта.**
 | 4–5 | Android: SQLCipher AAR, VaultManager-скелет (**plaintext DEK, Keystore — TODO после §6**), схема v1, миграция MushService на Vault-хранение |
 | 6 | Kotlin identicon (golden == Rust через identiconBytes) + UI (Onboarding/Contacts) |
 | 7 | Safety Number UI (**после persistence contacts — иначе Verified теряется при рестарте; UI раньше Vault = генератор багов**) |
-| 8 | Эмуляторные интеграционные (restart-persistence) |
+| 8 | Эмуляторные интеграционные (restart-persistence) — **закрыт вручную** (restart-persistence проверен на эмуляторе при днях 4–7: NodeState, идентикон, Verified — каждый через force-stop). Автоматизация `connectedAndroidTest` **отложена в буфер 9–10** — явно, не молча |
 | 9–10 | Буфер: hardware-чеклист §6 при приезде телефонов (**Keystore-обёртка DEK заменяет plaintext**), баги |
 
 ## 8. Риски

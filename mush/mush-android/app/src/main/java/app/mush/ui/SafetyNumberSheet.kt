@@ -18,10 +18,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -32,18 +29,19 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import app.mush.Native
 
-/** Сверка safety number (MUSH-B-SPEC §3.1, день 7). Modal: 60 цифр, 12 групп
- *  по 5, monospace + идентиконы обеих сторон (Rust — источник правды
- *  рендеринга); «Скопировать» / «Поделиться» для сверки по третьему каналу.
- *  «Совпадает» -> Verified (persist Vault, вызывающий код шлёт MarkVerified);
- *  «Не совпадает» -> предупреждение, отправка НЕ блокируется (A'-модель
- *  доверия), контакт остаётся unverified. */
+/** Сверка safety number (MUSH-B-SPEC §3.1/§3.2, дни 6–7). Modal: 60 цифр,
+ *  12 групп по 5, monospace + идентиконы обеих сторон (Rust — источник
+ *  правды рендеринга); «Скопировать» / «Поделиться» для сверки по третьему
+ *  каналу. «Совпадает» -> Verified; «Не совпадает» -> VerificationFailed
+ *  (persist Vault, красный индикатор; verified_at не трогаем). Отправка НЕ
+ *  блокируется (A'-модель доверия); FAILED снимается только явной повторной
+ *  сверкой. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SafetyNumberSheet(
     contact: Contact,
     myPubkeyB64: String,
-    onVerified: () -> Unit,
+    onTrust: (UiTrust) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -56,7 +54,6 @@ fun SafetyNumberSheet(
             }
         }.getOrNull()
     }
-    var mismatchWarned by remember { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -72,6 +69,14 @@ fun SafetyNumberSheet(
                 "Сверка с ${contact.name}",
                 style = MaterialTheme.typography.titleLarge,
             )
+            // §3.2: FAILED-контакт открывает sheet с пометкой прошлой сверки.
+            if (contact.trust == UiTrust.FAILED) {
+                Text(
+                    "Предыдущая сверка: не совпало",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
             Row(
                 horizontalArrangement = Arrangement.spacedBy(24.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -94,7 +99,6 @@ fun SafetyNumberSheet(
                     Text(
                         num,
                         style = TextStyle(fontFamily = FontFamily.Monospace),
-                        // 12 групп по 5: переносим по 4 группы в строку.
                         softWrap = true,
                     )
                 }
@@ -105,30 +109,37 @@ fun SafetyNumberSheet(
                     OutlinedButton(onClick = {
                         val send = Intent(Intent.ACTION_SEND).apply {
                             type = "text/plain"
-                            putExtra(Intent.EXTRA_TEXT, "Mush safety number ($contact.name):\n$num")
+                            putExtra(Intent.EXTRA_TEXT, "Mush safety number (${contact.name}):\n$num")
                         }
                         context.startActivity(Intent.createChooser(send, null))
                     }) { Text("Поделиться") }
                 }
-                if (!contact.verified) {
-                    Button(onClick = {
-                        onVerified()
-                        onDismiss()
-                    }) { Text("Совпадает") }
-                } else {
-                    Text(
+                when (contact.trust) {
+                    UiTrust.VERIFIED -> Text(
                         "✓ Контакт верифицирован",
                         color = MaterialTheme.colorScheme.primary,
                         style = MaterialTheme.typography.bodyMedium,
                     )
+                    else -> Button(onClick = {
+                        onTrust(UiTrust.VERIFIED)
+                        onDismiss()
+                    }) { Text("Совпадает") }
                 }
-                TextButton(onClick = { mismatchWarned = true }) {
-                    Text("Не совпадает", color = MaterialTheme.colorScheme.error)
-                }
-                if (mismatchWarned) {
+                if (contact.trust != UiTrust.FAILED) {
+                    TextButton(onClick = {
+                        // Пользователь явно сказал «не совпадает» — persist
+                        // FAILED (не просто предупреждение). Повторная сверка
+                        // (которая совпадёт) — единственный путь снять FAILED.
+                        onTrust(UiTrust.FAILED)
+                        onDismiss()
+                    }) {
+                        Text("Не совпадает", color = MaterialTheme.colorScheme.error)
+                    }
+                } else {
                     Text(
                         "⚠ Ключ изменился с прошлого раза. Отправка не " +
-                            "блокируется, но контакт остаётся неверифицированным.",
+                            "блокируется, но контакт остаётся подозрительным, " +
+                            "пока вы явно не пересверите.",
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodySmall,
                     )

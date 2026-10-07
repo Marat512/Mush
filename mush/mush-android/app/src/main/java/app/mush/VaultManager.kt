@@ -15,14 +15,24 @@ data class VaultMessage(
     val createdAt: Long,
 )
 
-/** Уровень доверия контакта (MUSH-B-SPEC §3.1: Verified после сверки safety
- * number; отправка без Verified не блокируется, но баннер остаётся). */
+/** Уровень доверия контакта (MUSH-B-SPEC §3.1/§3.2).
+ *
+ * `verification_failed` — ТЕКСТ-значение в существующей колонке contacts.
+ * trust_level: DDL-миграция НЕ нужна, schema_version остаётся 1 — значение
+ * добавочное (§3.2 зафиксировано до кода). Verified ставит «Совпадает»,
+ * VerificationFailed — только явное «Не совпадает»; снимается только явной
+ * повторной сверкой. */
 enum class TrustLevel {
     UNVERIFIED,
     VERIFIED,
+    VERIFICATION_FAILED,
     ;
 
-    fun toDbValue(): String = name.lowercase()
+    fun toDbValue(): String = when (this) {
+        UNVERIFIED -> "unverified"
+        VERIFIED -> "verified"
+        VERIFICATION_FAILED -> "verification_failed"
+    }
 
     companion object {
         fun fromDbValue(value: String): TrustLevel =
@@ -50,7 +60,12 @@ class VaultManager private constructor(
         private const val KEY_NODE_STATE = "node_state"
 
         /** Открыть (или создать) Vault: files/vault/mush.db с миграциями до
-         * schema_version=1. [dekProvider] — временно plaintext, см. класс. */
+         * schema_version=1. [dekProvider] — временно plaintext, см. класс.
+         *
+         * Ошибки DEK НЕ глотаем: unwrap-Result прокидывается наружу как
+         * бросок [DekError] (он же Exception). Граница Result — VaultManager:
+         * MushService ловит DekError и решает (временное поведение до §1.2.1:
+         * работа без Vault, identity эфемерна). */
         @JvmStatic
         fun open(context: Context, dekProvider: DekProvider = PlaintextDekProvider()): VaultManager {
             // sqlcipher-android 4.17: классы AAR не грузят нативную либу сами
@@ -58,7 +73,7 @@ class VaultManager private constructor(
             // companion-init грузил бы либу и в JVM-тестах (UnsatisfiedLinkError).
             System.loadLibrary("sqlcipher")
             val dir = File(context.filesDir, "vault").apply { mkdirs() }
-            val dek = loadOrCreateDek(File(dir, "dek.bin"), dekProvider)
+            val dek = loadOrCreateDek(File(dir, "dek.bin"), dekProvider).getOrThrow()
             // Нативная либа грузится статическим инициализатором SQLCipher
             // 4.17+ (loadLibs убран из API). Raw 32-байтовый DEK — PRAGMA key
             // эквивалент на уровне API.
@@ -74,18 +89,25 @@ class VaultManager private constructor(
 
         /** DEK: есть dek.bin -> unwrap; нет -> сгенерировать, wrap, записать.
          * Файл пишем через временный + rename (атомарность: обрезок dek.bin
-         * = потеря Vault, это единственный ключ). */
-        internal fun loadOrCreateDek(dekFile: File, provider: DekProvider): ByteArray {
+         * = потеря Vault, это единственный ключ). Result: порча dek.bin ->
+         * failure([DekError.CORRUPTED]), не исключение-непойманка. */
+        internal fun loadOrCreateDek(dekFile: File, provider: DekProvider): Result<ByteArray> {
             if (dekFile.isFile) {
-                val dek = provider.unwrap(dekFile.readBytes())
-                require(dek.size == 32) { "dek.bin: ожидалось 32 байта, got ${dek.size}" }
-                return dek
+                val unwrapped = provider.unwrap(dekFile.readBytes())
+                if (unwrapped.isFailure) return unwrapped
+                val dek = unwrapped.getOrThrow()
+                return if (dek.size == 32) {
+                    Result.success(dek)
+                } else {
+                    Result.failure(DekError.INVALID_LENGTH)
+                }
             }
             val dek = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val wrapped = provider.wrap(dek).getOrThrow()
             val tmp = File(dekFile.parentFile, dekFile.name + ".tmp")
-            tmp.writeBytes(provider.wrap(dek))
+            tmp.writeBytes(wrapped)
             check(tmp.renameTo(dekFile)) { "cannot rename ${tmp.name} -> ${dekFile.name}" }
-            return dek
+            return Result.success(dek)
         }
 
         /** Миграции до [VaultSchema.SCHEMA_VERSION]. meta-таблицы на свежей
@@ -136,7 +158,9 @@ class VaultManager private constructor(
         }
     }
 
-    /** Контакт: upsert имени и уровня доверия (§3.1). */
+    /** Контакт: upsert имени и уровня доверия (§3.1/§3.2). verified_at
+     *  ставится ТОЛЬКО при переходе в VERIFIED; VERIFICATION_FAILED его не
+     *  трогает (момент последней успешной сверки сохраняется). */
     @Synchronized
     fun upsertContact(pubkey: ByteArray, name: String, trustLevel: TrustLevel) {
         db.execSQL(
@@ -174,12 +198,13 @@ class VaultManager private constructor(
         val trust: TrustLevel,
     )
 
-    /** Добавить контакт, если его ещё нет (handshake не затирает имя,
-     *  заданное пользователем, и не сбрасывает trust). */
+    /** Re-handshake merge (MUSH-B-SPEC §3.2): имя — из свежего handshake,
+     *  trust_level и verified_at СОХРАНЯЮТСЯ (verification не сбрасывается
+     *  при повторном подключении). SQL — [VaultSchema.insertContactMerge]. */
     @Synchronized
     fun addContactIfAbsent(pubkey: ByteArray, name: String) {
         db.execSQL(
-            "INSERT OR IGNORE INTO ${VaultSchema.TABLE_CONTACTS}(pubkey, name, trust_level) VALUES(?, ?, ?)",
+            VaultSchema.insertContactMerge(),
             arrayOf(pubkey, name, TrustLevel.UNVERIFIED.toDbValue()),
         )
     }

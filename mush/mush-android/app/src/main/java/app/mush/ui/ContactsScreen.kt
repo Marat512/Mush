@@ -77,11 +77,11 @@ fun ContactsScreen(viewModel: MushViewModel, onShowQr: () -> Unit) {
                             .padding(vertical = 4.dp)
                             .combinedClickable(
                                 onClick = { verifyTarget = contact },
-                                // Debug-пометка Verified без сверки (день 6,
-                                // plumbing-проверка §3.1). Полный flow —
-                                // тап -> SafetyNumberSheet (день 7).
+                                // Debug long-press: верификация без сверки
+                                // (plumbing-проверка §3.1). Полный flow —
+                                // tap -> SafetyNumberSheet.
                                 onLongClick = {
-                                    viewModel.send(NodeCommand.MarkVerified(contact.pubkey))
+                                    viewModel.send(NodeCommand.SetTrust(contact.pubkey, UiTrust.VERIFIED))
                                 },
                             ),
                     ) {
@@ -104,13 +104,22 @@ fun ContactsScreen(viewModel: MushViewModel, onShowQr: () -> Unit) {
                                         contact.name,
                                         style = MaterialTheme.typography.titleSmall,
                                     )
-                                    if (contact.verified) {
-                                        Text(
+                                    // §3.2: verified — галочка, verification_failed
+                                    // — красный индикатор (отправка не блокируется).
+                                    when (contact.trust) {
+                                        UiTrust.VERIFIED -> Text(
                                             " ✓ verified",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = MaterialTheme.colorScheme.primary,
                                             modifier = Modifier.padding(start = 4.dp),
                                         )
+                                        UiTrust.FAILED -> Text(
+                                            " ✗ сверка не совпала",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.padding(start = 4.dp),
+                                        )
+                                        UiTrust.UNVERIFIED -> Unit
                                     }
                                 }
                                 Text(
@@ -133,7 +142,7 @@ fun ContactsScreen(viewModel: MushViewModel, onShowQr: () -> Unit) {
         SafetyNumberSheet(
             contact = contact,
             myPubkeyB64 = state.myPubkey,
-            onVerified = { viewModel.send(NodeCommand.MarkVerified(contact.pubkey)) },
+            onTrust = { trust -> viewModel.send(NodeCommand.SetTrust(contact.pubkey, trust)) },
             onDismiss = { verifyTarget = null },
         )
     }

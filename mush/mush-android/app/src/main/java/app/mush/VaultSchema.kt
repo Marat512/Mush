@@ -50,6 +50,16 @@ object VaultSchema {
     fun insertSchemaVersion(version: Int): String =
         "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '$version')"
 
+    /** Re-handshake merge (§3.2): имя — из свежего handshake, trust_level и
+     *  verified_at СОХРАНЯЮТСЯ (conflict-ветка трогает только name).
+     *  SQLite ON CONFLICT — 3.24+, SQLCipher 4.17 ок. */
+    fun insertContactMerge(): String =
+        """
+        INSERT INTO $TABLE_CONTACTS(pubkey, name, trust_level)
+        VALUES(?, ?, ?)
+        ON CONFLICT(pubkey) DO UPDATE SET name = excluded.name
+        """.trimIndent()
+
     /** Выражения для перехода с версии [fromVersion] на текущую.
      * 0 = новая БД. Пустой список — БД уже на актуальной версии. */
     fun migrationStatements(fromVersion: Int): List<String> = when {

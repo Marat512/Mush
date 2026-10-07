@@ -27,7 +27,17 @@ data class ChatMessage(
     val mine: Boolean,
 )
 
-data class Contact(val pubkey: String, val name: String, val connected: Boolean, val verified: Boolean = false)
+data class Contact(
+    val pubkey: String,
+    val name: String,
+    val connected: Boolean,
+    /** Доверие из Vault (MUSH-B-SPEC §3.2): unverified | verified |
+     *  verification_failed. КРАСНЫЙ индикатор у FAILED, галочка у VERIFIED. */
+    val trust: UiTrust = UiTrust.UNVERIFIED,
+)
+
+/** UI-модель trust (зеркало Vault TrustLevel без Android-зависимостей слоя). */
+enum class UiTrust { UNVERIFIED, VERIFIED, FAILED }
 
 data class AlertItem(
     val id: String,
@@ -53,9 +63,10 @@ sealed interface NodeCommand {
     data class SendMessage(val text: String) : NodeCommand
     data class Join(val invite: String) : NodeCommand
     data class DismissAlert(val id: String) : NodeCommand
-    /** Этап B (§3.1): «Совпадает» на экране сверки safety number —
-     *  контакт получает Verified (persist в Vault). */
-    data class MarkVerified(val pubkey: String) : NodeCommand
+    /** Этап B (§3.1/§3.2): результат сверки safety number — Verified
+     *  («Совпадает») или Failed («Не совпадает», persist в Vault, красный
+     *  индикатор). Отправка не блокируется (A'-модель доверия). */
+    data class SetTrust(val pubkey: String, val trust: UiTrust) : NodeCommand
     /** Этап B (флаг 4): Onboarding записал имя — поднимаем listener/сеть.
      *  Identity (handle) существует к этому моменту, см. MushService.initNode. */
     data object StartNetworking : NodeCommand
