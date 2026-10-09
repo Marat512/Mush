@@ -194,7 +194,7 @@ SQLCipher и миграция — без гейта.**
 | 4–5 | Android: SQLCipher AAR, VaultManager-скелет (**plaintext DEK, Keystore — TODO после §6**), схема v1, миграция MushService на Vault-хранение |
 | 6 | Kotlin identicon (golden == Rust через identiconBytes) + UI (Onboarding/Contacts) |
 | 7 | Safety Number UI (**после persistence contacts — иначе Verified теряется при рестарте; UI раньше Vault = генератор багов**) |
-| 8 | Эмуляторные интеграционные (restart-persistence) — **закрыт вручную** (restart-persistence проверен на эмуляторе при днях 4–7: NodeState, идентикон, Verified — каждый через force-stop). Автоматизация `connectedAndroidTest` **отложена в буфер 9–10** — явно, не молча |
+| 8 | Эмуляторные интеграционные (restart-persistence) — **автоматизирован**: `connectedAndroidTest` (Vault restart-persistence: VERIFIED/VERIFICATION_FAILED + история переживают close()+reopen; cold-start: trust из Vault рендерится в Contacts реальный, не дефолт). Гоняется локально на эмуляторе/устройстве (`./gradlew connectedDebugAndroidTest`), в CI не добавляется. Настоящий force-stop остаётся в §6 hardware-check (из тест-процесса недостижим) |
 | 9–10 | Буфер: hardware-чеклист §6 при приезде телефонов (**Keystore-обёртка DEK заменяет plaintext**), баги |
 
 ## 8. Риски

@@ -14,6 +14,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
 
@@ -53,5 +54,13 @@ dependencies {
     // SQLCipher 4.17+ ссылается на androidx.sqlite-типы в сигнатурах API.
     implementation("androidx.sqlite:sqlite:2.4.0")
     testImplementation("junit:junit:4.13.2")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    // Этап B день 8 (MUSH-B-SPEC §7): instrumented restart-persistence.
+    // Гоняется локально `./gradlew connectedDebugAndroidTest` на эмуляторе/
+    // устройстве; в CI не добавляется (по спеке — тест на устройствах).
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.09.03"))
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
 }

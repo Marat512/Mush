@@ -180,11 +180,18 @@ class VaultManager private constructor(
         )
     }
 
+    /** BLOB-литерал для инлайна в SQL. sqlcipher-android 4.17 не биндит
+     *  ByteArray из selectionArgs как BLOB (WHERE pubkey=? молча не матчит
+     *  записанный BLOB) — поэтому BLOB-ключи в rawQuery инлайнятся hex-строкой.
+     *  Pin-поведение: BlobBindingRegressionTest. */
+    private fun blobLiteral(b: ByteArray): String =
+        b.joinToString(separator = "", prefix = "x'", postfix = "'") { "%02x".format(it) }
+
     @Synchronized
     fun contactTrustLevel(pubkey: ByteArray): TrustLevel? {
         val cursor = db.rawQuery(
-            "SELECT trust_level FROM ${VaultSchema.TABLE_CONTACTS} WHERE pubkey=?",
-            arrayOf(pubkey),
+            "SELECT trust_level FROM ${VaultSchema.TABLE_CONTACTS} WHERE pubkey=${blobLiteral(pubkey)}",
+            null,
         ) ?: return null
         return cursor.use {
             if (it.moveToFirst()) TrustLevel.fromDbValue(it.getString(0)) else null
@@ -243,8 +250,8 @@ class VaultManager private constructor(
     fun messagesFor(groupId: ByteArray): List<VaultMessage> {
         val out = mutableListOf<VaultMessage>()
         val cursor = db.rawQuery(
-            "SELECT id, group_id, sender, lamport, text, created_at FROM ${VaultSchema.TABLE_MESSAGES} WHERE group_id=? ORDER BY lamport",
-            arrayOf(groupId),
+            "SELECT id, group_id, sender, lamport, text, created_at FROM ${VaultSchema.TABLE_MESSAGES} WHERE group_id=${blobLiteral(groupId)} ORDER BY lamport",
+            null,
         ) ?: return out
         cursor.use {
             while (it.moveToNext()) {
