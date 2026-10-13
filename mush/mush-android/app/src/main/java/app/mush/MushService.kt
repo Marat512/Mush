@@ -172,6 +172,19 @@ class MushService : Service() {
                         }
                         "decoy" -> MushStore.send(NodeCommand.DebugDecoy)
                         "start" -> MushStore.send(NodeCommand.StartNetworking)
+                        // Свежий invite (новый nonce + неиспользованный OPK).
+                        // Нужен для мультиджойна в группу: bundle в invite
+                        // одноразовый (OPK сжигается при первом handshake —
+                        // tombstone от повторного использования, crypto/ratchet.rs),
+                        // без перевыпуска второй джойнер получает reject.
+                        // Тест-план §3.5; продуктовый auto-reissue — TODO Phase 1.
+                        "reinvite" -> {
+                            val h = handle
+                            if (h != 0L) {
+                                val inv = Native.invite(h)
+                                Log.i("mush", "invite=$inv")
+                            }
+                        }
                         // Принудительный LAN-режим (debug): EMUI 10 гасит STA
                         // при подъёме softap на том же радио — клиенту чужого
                         // AP hotspot вредит. Закрываем reservation и
