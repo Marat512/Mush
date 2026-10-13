@@ -139,7 +139,19 @@ API 27 ≥ minSdk 26 → in scope.
 
 **Различение — tcpdump на клиенте (один прогон, ~20 мин):** capture на owner'е (wlan0, порт listener'а) во время join. SYN приходит на интерфейс → блок уровня хоста (firewall #1). SYN не приходит → AP isolation (#2) или сегменты (#3). Результат определяет, нужна ли переработка транспорта: при #2 пересмотр обязателен до Phase 1.
 
-Статус: POCO/Huawei — блок зафиксирован, причина до различения tcpdump'ом; тогглы не найдены (bounded exploration 30 мин, далее — запись в vendor-протокол и движение дальше); Samsung A36 — TBD через inbound-пробу §4.1.
+**Результат различения (13.10 вечер, /proc/net/tcp вместо tcpdump — бинаря нет на обоих): причина №1 — host-level vendor firewall, у вендоров разные модели блока:**
+
+| Направление | Наблюдение | Модель блока |
+|---|---|---|
+| POCO → Huawei (AP у Huawei) | Kernel-handshake ЗАВЕРШАЕТСЯ (клиент в TIME_WAIT), **accept у приложения не fire'ится** | EMUI: **stealth-SYN** — firewall отвечает на handshake сам, соединение устанавливается, приложению не доставляет |
+| Huawei → POCO (AP у Huawei) | Клиент застревает в **SYN_SENT**, retransmit растёт, у owner'а только LISTEN-сокет | HyperOS: **hard drop** — SYN игнорируется молча, таймаут у клиента |
+
+Следствия:
+- **AP isolation (№2) и NAT (№3) ИСКЛЮЧЕНЫ** — handshake на AP-пути у EMUI доходит до kernel хоста ⇒ доставка client↔host через startLocalOnlyHotspot работает. Samsung (AOSP-based Global) по этой причине блока не должен страдать.
+- **connect() успешен — не доказательство reachability** на stealth-вендорах (EMUI): mush-инициатор верит, что пир доступен; блок виден только по тишине responder'а. HyperOS даёт честный таймаут.
+- Лечение — только вендорский whitelist (точный путь не найден; bounded exploration 30 мин) или смена owner'а на устройство без блока (Samsung).
+
+Статус: POCO/Huawei — блок зафиксирован на kernel-уровне, причина различена; Samsung A36 — TBD через inbound-пробу §4.1.
 
 ## 4. Phase 1 — после приезда Samsung
 
