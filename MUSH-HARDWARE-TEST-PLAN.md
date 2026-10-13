@@ -129,6 +129,12 @@ API 27 ≥ minSdk 26 → in scope.
 10. **LAN-фallback (0.3) на парке = FAIL по той же причине.** Проверен путь через домашний роутер (POCO ↔ Huawei, оба на STA 192.168.31.x): kernel-handshake завершается (TIME_WAIT у клиента), accept у приложения не fire'ится — **stealth-блок EMUI глобален по интерфейсам, не специфичен для softap**. LAN-режим вендорский firewall не обходит. Для парка вывод: ни hotspot, ни LAN не дают прямого TCP между HyperOS/EMUI-устройствами.
 11. **Redmi 5 (0.4): установка заблокирована** — INSTALL_FAILED_USER_RESTRICTED (тот же MIUI-тоггл «Установка через USB», пользователь не уверен, что включён). API 27 подтверждён → in scope как клиент, как только APK установится (ручная установка с флешки обходит ограничение).
 
+**Дополнение 2 (вечер 13.10, прорыв):**
+
+12. **0.2 PASS на железе: Huawei (EMUI 10, arm64) ↔ Redmi 5 (MIUI 8.1, API 27).** Ручная установка APK на Mi 9T и Redmi 5 прошла; Redmi 5 как owner: `accepted connection` + HandshakeComplete на обеих сторонах, двусторонний /send доставлен (`hello` туда, `privet` обратно). Вся цепочка X3DH + Double Ratchet + CRDT-доставка работает на реальном ARM-железе двух вендоров.
+13. **Вендорский inbound-блок — привилегия НОВЫХ оболочек.** Redmi 5 на MIUI 8.1 (2018, API 27) входящие TCP к приложению ПРИНИМАЕТ — stealth/hard-блоков нет. Старый парк выстраивается: **owner = Redmi 5** (или Samsung при приезде), HyperOS/EMUI-устройства — клиентами (их outbound работает штатно).
+14. minSdk boundary: API 27 — полный cold start без крашей (hotspot, listener, invite, foreground-service). Самая нижняя вилка поддержки (26–27) на железе подтверждена.
+
 ## 3.6. Vendor inbound blocking (работающий раздел)
 
 **Симптом на парке:** оба устройства (POCO HyperOS 3.0, Huawei EMUI 10) роняют входящие TCP к приложению при работающем listener'е (loopback-accept через `adb forward` работает штатно). «SYN drop» — не один феномен, три разные причины с разными следствиями:
@@ -310,7 +316,7 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 | POCO M6 Pro | 16 | 36 | _______ | Y / N | Y / N | Y / N |
 | Xiaomi Mi 9T | 11 | 30 | _______ | Y / N | Y / N | Y / N |
 | Huawei STK-LX1 | 10 | 29 | _______ | Y / N | Y / N | Y / N |
-| Redmi 5 | 8.1 | 27 | — (client) | — | Y / N | — |
+| Redmi 5 | 8.1 | 27 | 192.168.43.1 | Y | Y | Y |
 
 ### 6.2. Метрики производительности
 
