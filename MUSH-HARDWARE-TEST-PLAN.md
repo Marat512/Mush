@@ -129,6 +129,7 @@ Samsung = Owner/Reference. POCO переходит в Stress Client.
 ### 4.1. Pre-flight
 
 - [ ] Samsung: `getprop ro.csc.sales_code` → EUX/SER/DBT (Global). Если MTS/SBL/BIL → hotspot может быть заблокирован.
+- [ ] **Inbound-проба на КАЖДОМ устройстве парка до старта пайплайна** (нах. 2/4 §3.5: HyperOS и EMUI блокируют входящий TCP к приложению): нода подняла listener → TCP-connect к ней с другого устройства (не через `adb forward` — он loopback и блок не показывает) → строка `accepted connection` в logcat обеих сторон. Нет строки = вендорный блок → сначала whitelist-тогглы (Security app / Phone Manager), потом пайплайн. Без этой пробы дни 1–2 уйдут на диагностику «handshake не доходит» вместо реальных тестов.
 - [ ] Кабели: оригинальные или UGREEN/Baseus 3A, по одному на устройство. Дешёвые кабели + 5 портов на хабе = flaky ADB.
 - [ ] `adb devices -l` — все 5 устройств в статусе device. Один offline или unauthorized = чинить кабель/порт, потом начинать прогон.
 - [ ] Battery optimization off на всех устройствах.
@@ -292,6 +293,7 @@ adb logcat -s mush:D mush_jni:D AndroidRuntime:E *:S
 |---|---|---|
 | POCO hotspot | onFailed reason=N в logcat | N=3 → rate-limit, fallback owner №2 |
 | POCO battery kill | Settings → Battery → No restrictions | Если выключено → включить, перетестировать |
+| Входящий TCP не доходит (любое устройство) | Connect с пира завершается, а `accepted connection` в logcat owner'а нет; через `adb forward` accept есть | Вендорный firewall (нах. 2/4 §3.5) → whitelist-тогглы вендора; убедиться, что проба НЕ через loopback |
 | Samsung hotspot | getprop ro.csc.sales_code | MTS/SBL/BIL → операторский, риск блокировки |
 | Huawei hotspot | Работает ли вообще | Ожидаемо fail → LAN fallback |
 | Mi 9T handshake | Logcat, сравнить с Samsung | Если Samsung OK, Mi 9T нет → vendor quirk |
