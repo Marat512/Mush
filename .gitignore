@@ -7,3 +7,4 @@ mush/mush-android/.gradle/
 mush/mush-android/local.properties
 *.iml
 .idea/
+scripts/hardware-verify-*.log
