@@ -124,8 +124,22 @@ API 27 ≥ minSdk 26 → in scope.
 
 **Дополнение (вечер 13.10, прогон после тогглов):**
 
-8. **Initiator-side `Handshake complete` — НЕ доказательство связности.** В ratchet-пути X3DH initiator вычисляет сессионный ключ локально и эмитит событие после ОТПРАВКИ init-фрейма, без подтверждения от responder'а. Симптом «у joiner'а Handshake complete, у owner'а тишина» = вендорный блок inbound на owner'е, а не успешный handshake. Ассерт для hardware-прогона: `accepted connection` + HandshakeComplete на ОБЕИХ сторонах либо доставка `message from`.
+8. **Принцип тестирования Mush (DTN): успех на одной стороне не доказывает ничего про вторую.** Причина фундаментальна: X3DH по дизайну асинхронен — initiator не ждёт ответа, потому что responder в DTN может быть offline часами; локальный эмит HandshakeComplete — фича, не баг. Значит, симптом «у joiner'а Handshake complete, у owner'а тишина» = блок inbound на owner'е, а не успех. **Ассерт любого hardware-теста — на обеих сторонах** (accepted connection + HandshakeComplete у обоих, либо доставка `message from`). В групповом чате (дни 6–8) тот же принцип: «сообщение отправлено» у одного участника не доказывает доставку остальным — ассерт по истории всех узлов.
 9. **Тогглы пользователя (13.10 вечер):** Huawei Phone Manager (автозапуск/фон) — выживание процесса починено (15+ мин в фоне против 3–4), **но inbound TCP не разблокирован**. POCO (HyperOS Security) — inbound не разблокирован (SYN drop сохраняется в foreground и с включённым экраном). Точные вендорные пути для inbound-allowlist не найдены (веб-поиск не дал подтверждённого решения) — требуется ручной поиск на устройстве либо Samsung как owner.
+
+## 3.6. Vendor inbound blocking (работающий раздел)
+
+**Симптом на парке:** оба устройства (POCO HyperOS 3.0, Huawei EMUI 10) роняют входящие TCP к приложению при работающем listener'е (loopback-accept через `adb forward` работает штатно). «SYN drop» — не один феномен, три разные причины с разными следствиями:
+
+| # | Причина | Что это | Следствие |
+|---|---|---|---|
+| 1 | Vendor firewall (app-level) | HyperOS/EMUI блокируют входящие для приложений без явного разрешения; тоггл существует, но не найден | Samsung Global, вероятно, не страдает; лечится whitelist'ом вендора |
+| 2 | **AP isolation в startLocalOnlyHotspot** | На части Android клиенты локального hotspot'а не могут достучаться до TCP-сервисов самого AP-хоста — документированное поведение | **Samsung НЕ спасёт** — тот же API. Лечение: WifiConfiguration+reflection (deprecated, местами работает) или LAN-режим как основной, а не fallback |
+| 3 | NAT между сегментами | Клиент и хост в разных подсетях — SYN дропает маршрутизатор | Лечится адресацией (оба в одном сегменте) |
+
+**Различение — tcpdump на клиенте (один прогон, ~20 мин):** capture на owner'е (wlan0, порт listener'а) во время join. SYN приходит на интерфейс → блок уровня хоста (firewall #1). SYN не приходит → AP isolation (#2) или сегменты (#3). Результат определяет, нужна ли переработка транспорта: при #2 пересмотр обязателен до Phase 1.
+
+Статус: POCO/Huawei — блок зафиксирован, причина до различения tcpdump'ом; тогглы не найдены (bounded exploration 30 мин, далее — запись в vendor-протокол и движение дальше); Samsung A36 — TBD через inbound-пробу §4.1.
 
 ## 4. Phase 1 — после приезда Samsung
 
@@ -298,7 +312,7 @@ adb logcat -s mush:D mush_jni:D AndroidRuntime:E *:S
 |---|---|---|
 | POCO hotspot | onFailed reason=N в logcat | N=3 → rate-limit, fallback owner №2 |
 | POCO battery kill | Settings → Battery → No restrictions | Если выключено → включить, перетестировать |
-| Входящий TCP: дифференциальный тест | Узел A коннектится к узлу B: accept через `adb forward` ЕСТЬ, при прямом Wi-Fi connect'е — НЕТ (connect при этом завершается успешно) | Это НЕ баг Mush — вендорский firewall (нах. 2/4 §3.5). Не искать в коде: идти включать whitelist вендора (Security app / Phone Manager) |
+| Входящий TCP: дифференциальный тест | Узел A коннектится к узлу B: accept через `adb forward` ЕСТЬ, при прямом Wi-Fi connect'е — НЕТ (connect при этом завершается успешно) | Это НЕ баг Mush — вендорский firewall (нах. 2/4 §3.5). Не искать в коде: сначала **tcpdump на owner'е** (wlan0, порт listener'а) — различить firewall (#1) vs AP isolation (#2) vs сегменты (#3) по §3.6; при #1 — whitelist вендора, при #2 — пересмотр транспорта |
 | Samsung hotspot | getprop ro.csc.sales_code | MTS/SBL/BIL → операторский, риск блокировки |
 | Huawei hotspot | Работает ли вообще | Ожидаемо fail → LAN fallback |
 | Mi 9T handshake | Logcat, сравнить с Samsung | Если Samsung OK, Mi 9T нет → vendor quirk |
