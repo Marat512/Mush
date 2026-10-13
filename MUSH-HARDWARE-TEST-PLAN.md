@@ -293,7 +293,7 @@ adb logcat -s mush:D mush_jni:D AndroidRuntime:E *:S
 |---|---|---|
 | POCO hotspot | onFailed reason=N в logcat | N=3 → rate-limit, fallback owner №2 |
 | POCO battery kill | Settings → Battery → No restrictions | Если выключено → включить, перетестировать |
-| Входящий TCP не доходит (любое устройство) | Connect с пира завершается, а `accepted connection` в logcat owner'а нет; через `adb forward` accept есть | Вендорный firewall (нах. 2/4 §3.5) → whitelist-тогглы вендора; убедиться, что проба НЕ через loopback |
+| Входящий TCP: дифференциальный тест | Узел A коннектится к узлу B: accept через `adb forward` ЕСТЬ, при прямом Wi-Fi connect'е — НЕТ (connect при этом завершается успешно) | Это НЕ баг Mush — вендорский firewall (нах. 2/4 §3.5). Не искать в коде: идти включать whitelist вендора (Security app / Phone Manager) |
 | Samsung hotspot | getprop ro.csc.sales_code | MTS/SBL/BIL → операторский, риск блокировки |
 | Huawei hotspot | Работает ли вообще | Ожидаемо fail → LAN fallback |
 | Mi 9T handshake | Logcat, сравнить с Samsung | Если Samsung OK, Mi 9T нет → vendor quirk |
