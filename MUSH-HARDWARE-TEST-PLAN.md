@@ -122,6 +122,11 @@ API 27 ≥ minSdk 26 → in scope.
 
 Вывод Phase 0 на текущем парке: **прямой device-to-device TCP заблокирован вендорами на обоих доступных устройствах.** Следующие шаги: (а) ручные whitelist-тогглы на POCO/Huawei (Security app / Phone Manager) и «Установка через USB» на Mi 9T/Redmi 5; (б) owner-тест на Samsung A36 при приезде (Global-прошивки обычно не блокируют inbound); (в) если вендорские блоки снять нельзя — пересмотр транспортной модели Phase 0 (outbound-only роли / рандеву через третий узел) как отдельное архитектурное решение.
 
+**Дополнение (вечер 13.10, прогон после тогглов):**
+
+8. **Initiator-side `Handshake complete` — НЕ доказательство связности.** В ratchet-пути X3DH initiator вычисляет сессионный ключ локально и эмитит событие после ОТПРАВКИ init-фрейма, без подтверждения от responder'а. Симптом «у joiner'а Handshake complete, у owner'а тишина» = вендорный блок inbound на owner'е, а не успешный handshake. Ассерт для hardware-прогона: `accepted connection` + HandshakeComplete на ОБЕИХ сторонах либо доставка `message from`.
+9. **Тогглы пользователя (13.10 вечер):** Huawei Phone Manager (автозапуск/фон) — выживание процесса починено (15+ мин в фоне против 3–4), **но inbound TCP не разблокирован**. POCO (HyperOS Security) — inbound не разблокирован (SYN drop сохраняется в foreground и с включённым экраном). Точные вендорные пути для inbound-allowlist не найдены (веб-поиск не дал подтверждённого решения) — требуется ручной поиск на устройстве либо Samsung как owner.
+
 ## 4. Phase 1 — после приезда Samsung
 
 Samsung = Owner/Reference. POCO переходит в Stress Client.
