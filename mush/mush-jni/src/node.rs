@@ -84,7 +84,10 @@ pub async unsafe fn node_start_listener(handle: *mut JniNode, port: u16) -> Resu
         let _ = tx.send(Ok(bound.port()));
         loop {
             match listener.accept().await {
-                Ok((socket, _)) => {
+                Ok((socket, addr)) => {
+                    // Диагностика responder-пути: до этой строки входящие
+                    // соединения в логах не видны (hardware-прогон).
+                    tracing::info!("mush-jni: accepted connection from {addr}");
                     let arc = arc.clone();
                     tokio::spawn(async move {
                         Node::handle_connection(arc, socket).await;
@@ -114,7 +117,9 @@ pub async unsafe fn node_start_listener(handle: *mut JniNode, port: u16) -> Resu
         .map_err(|_| "listener bind timed out".to_string())?
         .map_err(|_| "listener task died".to_string())??;
     node.bound = true;
-    tracing::info!("mush-jni: listener started on 127.0.0.1:{port}");
+    // Бинд реальный (0.0.0.0), лог — честный: тест-план (MUSH-HARDWARE-
+    // TEST-PLAN §3.3) читает эту строку как индикатор сетевого listener'а.
+    tracing::info!("mush-jni: listener started on 0.0.0.0:{port}");
     Ok(port)
 }
 

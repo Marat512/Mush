@@ -1390,12 +1390,16 @@ impl Node {
     pub async fn handle_connection(node: Arc<Mutex<Node>>, socket: TcpStream) {
         let (mut reader, writer) = socket.into_split();
         let Ok(Some(first)) = framing::read_frame(&mut reader).await else {
+            // Молчаливая смерть handler'а — главная невидимая дыра
+            // hardware-прогона (таймаут на recv выглядит как «нода глухая»).
+            tracing::warn!("connection handler: first frame read failed");
             return;
         };
 
         // Этап A, ratchet-режим: первый фрейм — X3dhInit (SNS не используется).
         if first.msg_type == TYPE_X3DH_INIT {
             let Ok(init) = first.decode::<ratchet::X3dhInit>() else {
+                tracing::warn!("connection handler: x3dh init decode failed");
                 return;
             };
             let completed = {

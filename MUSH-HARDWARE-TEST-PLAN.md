@@ -108,6 +108,20 @@ API 27 ≥ minSdk 26 → in scope.
 - ACCESS_FINE_LOCATION + GPS toggle обязательны.
 - startLocalOnlyHotspot с API 26, но реализация отличается от 29+. На Redmi 5 owner не проверять — только клиент.
 
+### 3.5. Находки Phase 0 (2026-10-13, прогон на POCO + Huawei)
+
+Зафиксировано на железе до закрытия 0.1–0.2:
+
+1. **POCO M6 Pro (HyperOS 3.0, API 36): hotspot поднимается стабильно** — `onStarted` с IP 10.14.255.160 на ap0, без rate-limit (3 прогона подряд). Креды random per start (`AndroidShare_NNNN`), в logcat (debug APK) пишутся для скриптов.
+2. **POCO: входящий TCP к приложению ЗАБЛОКИРОВАН вендорским firewall** — listener жив (проверено через `adb forward`), ping ходит, TCP-connect с пира таймаутится на обоих интерфейсах (wlan0 и ap0). Модель «клиент коннектится к owner по IP:port» на HyperOS не работает без вендорного whitelist (проверить Security app → сетевые разрешения для Mush — руками на устройстве).
+3. **Huawei STK-LX1 (EMUI 10, API 29): hotspot РАБОТАЕТ** — 192.168.43.1 на wlan0, `onStarted` с задержкой ~10 с (норма для EMUI). Ожидание «часто не работает» не подтвердилось.
+4. **Huawei: входящий TCP к приложению не доходит** — TCP-handshake со стороны пира завершается (клиент пишет initiation без ошибок), но accept-цикл приложения соединение не видит; при этом loopback-accept через `adb forward` работает штатно (accept + handler fire). Похоже на stealth-SYN firewall уровня ядра/ven­dor. Вердикт зафиксирован как «вход заблокирован вендором, требуется whitelist в Phone Manager» — подтвердить ручным тогглом на устройстве.
+5. **Huawei: процесс убивается EMUI каждые ~3–4 минуты в фоне** — deviceidle-whitelist НЕ спасает. Спасает foreground-activity + включённый экран (`stay_on_while_plugged_in=7`). Для прогонов: держать MainActivity на экране.
+6. **Mi 9T и Redmi 5 (MIUI): `adb install` отклонён — INSTALL_FAILED_USER_RESTRICTED** — нужен ручной тоггл «Установка через USB» в Developer options на каждом устройстве. До тоггла вне парка.
+7. **Инструментарий прогона (в коде, debuggable-only):** debug-broadcast `app.mush.debug.CMD` (join/send/flood/decoy/start/lan), логи invite/credentials/onStarted/onFailed/accepted connection/handshake/message/error в logcat под тегом `mush`. Локальный только скрипт-клиент вместо QR.
+
+Вывод Phase 0 на текущем парке: **прямой device-to-device TCP заблокирован вендорами на обоих доступных устройствах.** Следующие шаги: (а) ручные whitelist-тогглы на POCO/Huawei (Security app / Phone Manager) и «Установка через USB» на Mi 9T/Redmi 5; (б) owner-тест на Samsung A36 при приезде (Global-прошивки обычно не блокируют inbound); (в) если вендорские блоки снять нельзя — пересмотр транспортной модели Phase 0 (outbound-only роли / рандеву через третий узел) как отдельное архитектурное решение.
+
 ## 4. Phase 1 — после приезда Samsung
 
 Samsung = Owner/Reference. POCO переходит в Stress Client.

@@ -4,10 +4,15 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import app.mush.ui.ConnectionState
 import app.mush.ui.MushStore
 import app.mush.ui.NodeCommand
@@ -35,6 +40,7 @@ class MushService : Service() {
     private var lamportSeq = 0L
     /** Listener/сеть подняты (StartNetworking от Onboarding/autoStart). */
     private var networkingStarted = false
+    private var listeningPort = 0
 
     /** Этап B: внутренняя persistence узла (MUSH-B-SPEC §1). Это НЕ
      * user-facing Backup: флаг «export/import только явное действие» (§4)
@@ -59,6 +65,9 @@ class MushService : Service() {
      * до shutdown; Activity сюда не попадает. */
     private val callback = object : MushCallback {
         override fun onMessage(groupId: String, senderPubkey: String, text: String, ts: Long) {
+            // Лог для hardware-прогона: ассерт доставки — grep по logcat
+            // (тест-план §3.3, фильтр §6.3).
+            Log.i("mush", "message from=${senderPubkey.take(12)} text=$text")
             saveNodeStateThrottled()
             MushStore.update { s ->
                 val name = s.contacts.firstOrNull { it.pubkey == senderPubkey }?.name
@@ -92,6 +101,7 @@ class MushService : Service() {
         }
 
         override fun onHandshakeComplete(peerPubkey: String) {
+            Log.i("mush", "handshake complete peer=${peerPubkey.take(12)}")
             saveNodeStateThrottled()
             MushStore.update { s ->
                 val known = s.contacts.any { it.pubkey == peerPubkey }
@@ -119,6 +129,9 @@ class MushService : Service() {
         }
 
         override fun onError(code: Int, message: String) {
+            // В logcat тоже: иначе ошибки join/handshake невидимы в
+            // adb-прогоне (notification без монитора не читается).
+            Log.w("mush", "node error code=$code: $message")
             MushStore.update { it.copy(statusLine = "Error ($code): $message") }
             updateNotification("Error ($code)")
         }
@@ -127,6 +140,50 @@ class MushService : Service() {
     override fun onCreate() {
         super.onCreate()
         MushStore.commandSink = { cmd -> handleCommand(cmd) }
+        // Guard — debuggable APK (эквивалент BuildConfig.DEBUG, но без
+        // buildFeatures.buildConfig = true: флаг уже есть у ApplicationInfo).
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            registerDebugReceiver()
+        }
+    }
+
+    /** Debug-only (debuggable APK) хук для hardware-прогона: команды узла
+     *  из adb, без UI и камеры (тест-план §3.2: 0.2 join/send, 0.5 group):
+     *      am broadcast -a app.mush.debug.CMD --es cmd join  --es invite "<invite>"
+     *      am broadcast -a app.mush.debug.CMD --es cmd send  --es text "hello"
+     *      am broadcast -a app.mush.debug.CMD --es cmd flood --es n 50
+     *      am broadcast -a app.mush.debug.CMD --es cmd decoy
+     *  Receiver EXPORTED намеренно (shell uid 2000 шлёт broadcast);
+     *  в не-debuggable сборке не регистрируется — ветки нет в коде. */
+    private fun registerDebugReceiver() {
+        registerReceiver(
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context, intent: Intent) {
+                    when (intent.getStringExtra("cmd")) {
+                        "join" -> intent.getStringExtra("invite")?.let {
+                            Log.i("mush", "debug: join invited len=${it.length}")
+                            MushStore.send(NodeCommand.Join(it))
+                        }
+                        "send" -> intent.getStringExtra("text")?.let {
+                            MushStore.send(NodeCommand.SendMessage(it))
+                        }
+                        "flood" -> intent.getStringExtra("n")?.toIntOrNull()?.let {
+                            MushStore.send(NodeCommand.DebugFlood(it))
+                        }
+                        "decoy" -> MushStore.send(NodeCommand.DebugDecoy)
+                        "start" -> MushStore.send(NodeCommand.StartNetworking)
+                        // Принудительный LAN-режим (debug): EMUI 10 гасит STA
+                        // при подъёме softap на том же радио — клиенту чужого
+                        // AP hotspot вредит. Закрываем reservation и
+                        // адвертисим LAN-IP (retry: STA-реконнект занимает
+                        // секунды). Тест-план §3.1 (LAN fallback), 0.5 (group).
+                        "lan" -> forceLanMode()
+                    }
+                }
+            },
+            IntentFilter("app.mush.debug.CMD"),
+            Context.RECEIVER_EXPORTED,
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -185,6 +242,12 @@ class MushService : Service() {
                     myName = prefsName(),
                 )
             }
+            // Auto-resume (критерий 8 / soak): START_STICKY перезапускает
+            // сервис БЕЗ Activity — UI-команды StartNetworking при этом нет,
+            // и нода молчала бы вечно. Имя в prefs = onboarding пройден =
+            // пользователь ждёт работающую ноду. startNetworking идемпотентен
+            // (networkingStarted), повтор из UI/ChatsScreen безопасен.
+            if (prefsName().isNotBlank()) startNetworking()
         } catch (t: Throwable) {
             MushStore.update {
                 it.copy(phase = NodePhase.Error, statusLine = "Error: ${t.message}")
@@ -221,6 +284,7 @@ class MushService : Service() {
         networkingStarted = true
         try {
             val port = Native.startListener(h, 0)
+            listeningPort = port
             MushStore.update {
                 it.copy(
                     phase = NodePhase.Running,
@@ -247,6 +311,10 @@ class MushService : Service() {
             onReady = { ip ->
                 Native.setAdvertisedAddr(handle, "$ip:$port")
                 val invite = Native.invite(handle)
+                Log.i("mush", "networking ready: advertised $ip:$port")
+                // Invite == содержимое QR (§5.0) — публичен по дизайну; лог
+                // нужен скриптам прогона (клиент берёт строкой, без камеры).
+                Log.i("mush", "invite=$invite")
                 MushStore.update {
                     it.copy(
                         connection = ConnectionState.Hotspot(ip, port),
@@ -275,6 +343,30 @@ class MushService : Service() {
                 }
             },
         )
+    }
+
+    /** Debug (lan-команда): закрыть hotspot и адвертисить LAN-IP.
+     *  STA-реконнект после stopHotspot занимает секунды — retry до 20 с. */
+    private fun forceLanMode() {
+        NetworkManager.stopHotspot()
+        Thread {
+            val ip = (1..40).firstNotNullOfOrNull {
+                NetworkManager.lanIp()?.takeIf { ip -> !ip.startsWith("192.168.43.") }
+                    ?: run { Thread.sleep(500); null }
+            }
+            if (ip != null && handle != 0L) {
+                Native.setAdvertisedAddr(handle, "$ip:$listeningPort")
+                MushStore.update {
+                    it.copy(
+                        connection = ConnectionState.Lan(ip, listeningPort),
+                        statusLine = "LAN $ip:$listeningPort",
+                    )
+                }
+                Log.i("mush", "lan mode: advertised $ip:$listeningPort")
+            } else {
+                Log.w("mush", "lan mode: no LAN ip after 20s")
+            }
+        }.start()
     }
 
     private fun handleCommand(cmd: NodeCommand) {

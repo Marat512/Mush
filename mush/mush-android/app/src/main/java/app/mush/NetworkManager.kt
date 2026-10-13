@@ -1,10 +1,12 @@
 package app.mush
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import app.mush.ui.MushStore
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -18,6 +20,9 @@ import java.net.NetworkInterface
  * granted permission + (API < 33) включённый GPS, иначе SecurityException. */
 object NetworkManager {
     private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
+
+    /** Тег = "mush": единый logcat-фильтр прогона (§6.3 тест-плана). */
+    private const val TAG = "mush"
 
     val hotspotActive: Boolean get() = reservation != null
 
@@ -43,6 +48,9 @@ object NetworkManager {
     ) {
         val (ready, whyNot) = Permissions.hotspotReady(context)
         if (!ready) {
+            // Лог — обязателен: hardware-прогон драйвится через adb-logcat
+            // (MUSH-HARDWARE-TEST-PLAN §3.3), UI смотреть неудобно.
+            Log.w(TAG, "LocalOnlyHotspot blocked: $whyNot")
             MushStore.update { s -> s.copy(statusLine = "hotspot blocked: $whyNot") }
             onFailed(-1)
             return
@@ -51,6 +59,12 @@ object NetworkManager {
         val callback = object : WifiManager.LocalOnlyHotspotCallback() {
             override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
                 reservation = res
+                // SSID+pass — только debuggable APK: hardware-прогон драйвится
+                // скриптами, клиенту нужны креды ДО QR-скана (§3.3). В release
+                // пароль в logcat не пишется.
+                if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                    Log.i(TAG, "hotspot credentials ssid=${hotspotCredentials()?.first} pass=${hotspotCredentials()?.second}")
+                }
                 // IP AP может появиться с задержкой (Huawei HicomNfManager
                 // сам ретраит ~15с). Две фазы: сначала ищем ТОЛЬКО
                 // AP-интерфейс (ap0/swlan — HyperOS даёт ap0=10.51.89.x,
@@ -64,8 +78,10 @@ object NetworkManager {
                     }
                     Handler(Looper.getMainLooper()).post {
                         if (ip != null) {
+                            Log.i(TAG, "LocalOnlyHotspotCallback::onStarted ip=$ip")
                             onReady(ip)
                         } else {
+                            Log.w(TAG, "LocalOnlyHotspotCallback::onStarted but no AP interface IP after 15s")
                             MushStore.update { s -> s.copy(statusLine = "hotspot up but no AP interface IP after 15s") }
                             onFailed(-2)
                         }
@@ -74,12 +90,16 @@ object NetworkManager {
             }
 
             override fun onFailed(reason: Int) {
+                // reason=3 (ERROR_NO_CHANNEL) — vendor rate-limit
+                // (HyperOS): тест-план §3.1 — одна попытка, fallback.
+                Log.w(TAG, "LocalOnlyHotspotCallback::onFailed reason=$reason")
                 MushStore.update { s -> s.copy(statusLine = "hotspot onFailed($reason)") }
                 onFailed(reason)
             }
 
             override fun onStopped() {
                 reservation = null
+                Log.i(TAG, "LocalOnlyHotspotCallback::onStopped")
                 MushStore.update { s -> s.copy(statusLine = "hotspot stopped") }
             }
         }
