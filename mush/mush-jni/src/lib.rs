@@ -28,7 +28,7 @@ use node::{
     node_shutdown, node_start_listener,
 };
 use pure::{identicon_bytes, identicon_svg, safety_number};
-use runtime::runtime;
+use runtime::block_on_reentrant;
 
 /// Install a logcat writer for `tracing` events on Android (MS0: Rust logs
 /// visible in Logcat). No-op on host builds — tracing-android only compiles
@@ -82,6 +82,10 @@ pub extern "C" fn Java_app_mush_Native_init(
             KotlinCallback::new(&mut env, callback).map_err(|e| format!("callback ref: {e}"))?,
         );
         init_tracing_once();
+        // ABI загруженной .so: run-as app.mush + /proc/self/maps не всегда
+        // доступен проверяющему — фиксируем при загрузке либы (§3.5 п.15:
+        // Redmi 5 может тянуть armeabi-v7a .so вместо arm64).
+        tracing::info!("mush-jni: init (arch {})", std::env::consts::ARCH);
         let handle = node_init(&data_dir, sink)?;
         Ok(handle as jlong)
     }));
@@ -108,7 +112,7 @@ pub extern "C" fn Java_app_mush_Native_pubkey<'local>(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        runtime().block_on(unsafe { node_pubkey(handle as *mut node::JniNode) })
+        block_on_reentrant(unsafe { node_pubkey(handle as *mut node::JniNode) })
     }));
     match result {
         Ok(Ok(s)) => to_jstring(&mut env, s),
@@ -133,7 +137,7 @@ pub extern "C" fn Java_app_mush_Native_invite<'local>(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        runtime().block_on(unsafe { node_invite(handle as *mut node::JniNode) })
+        block_on_reentrant(unsafe { node_invite(handle as *mut node::JniNode) })
     }));
     match result {
         Ok(Ok(s)) => to_jstring(&mut env, s),
@@ -161,7 +165,7 @@ pub extern "C" fn Java_app_mush_Native_join(
         }
         let invite = get_string(&mut env, &invite)?;
         Ok(
-            runtime().block_on(unsafe { node_join(handle as *mut node::JniNode, &invite) })?
+            block_on_reentrant(unsafe { node_join(handle as *mut node::JniNode, &invite) })?
                 as jboolean,
         )
     }));
@@ -192,8 +196,9 @@ pub extern "C" fn Java_app_mush_Native_startListener(
         if !(0..=65535).contains(&port) {
             return Err(format!("bad port {port}"));
         }
-        let actual = runtime()
-            .block_on(unsafe { node_start_listener(handle as *mut node::JniNode, port as u16) })?;
+        let actual = block_on_reentrant(unsafe {
+            node_start_listener(handle as *mut node::JniNode, port as u16)
+        })?;
         Ok(actual as jint)
     }));
     match result {
@@ -248,16 +253,17 @@ pub extern "C" fn Java_app_mush_Native_send(
     group_id: JString,
     text: JString,
 ) -> jboolean {
-    let result = catch_unwind(AssertUnwindSafe(|| -> Result<jboolean, String> {
-        if handle == 0 {
-            return Err("null handle".to_string());
-        }
-        let group_id = get_string(&mut env, &group_id)?;
-        let text = get_string(&mut env, &text)?;
-        Ok(runtime()
-            .block_on(unsafe { node_send(handle as *mut node::JniNode, &group_id, &text) })?
-            as jboolean)
-    }));
+    let result =
+        catch_unwind(AssertUnwindSafe(|| -> Result<jboolean, String> {
+            if handle == 0 {
+                return Err("null handle".to_string());
+            }
+            let group_id = get_string(&mut env, &group_id)?;
+            let text = get_string(&mut env, &text)?;
+            Ok(block_on_reentrant(unsafe {
+                node_send(handle as *mut node::JniNode, &group_id, &text)
+            })? as jboolean)
+        }));
     match result {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
@@ -283,7 +289,7 @@ pub extern "C" fn Java_app_mush_Native_setAdvertisedAddr(
             return Err("null handle".to_string());
         }
         let addr = get_string(&mut env, &addr)?;
-        runtime().block_on(unsafe { node_set_advertised_addr(handle as *mut node::JniNode, &addr) })
+        block_on_reentrant(unsafe { node_set_advertised_addr(handle as *mut node::JniNode, &addr) })
     }));
     match result {
         Ok(Ok(())) => {}
@@ -303,9 +309,9 @@ pub extern "C" fn Java_app_mush_Native_flood(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        Ok(runtime()
-            .block_on(unsafe { node_flood(handle as *mut node::JniNode, n.max(0) as usize) })?
-            as jboolean)
+        Ok(block_on_reentrant(unsafe {
+            node_flood(handle as *mut node::JniNode, n.max(0) as usize)
+        })? as jboolean)
     }));
     match result {
         Ok(Ok(b)) => b,
@@ -330,7 +336,7 @@ pub extern "C" fn Java_app_mush_Native_decoy(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        Ok(runtime().block_on(unsafe { node_decoy(handle as *mut node::JniNode) })? as jboolean)
+        Ok(block_on_reentrant(unsafe { node_decoy(handle as *mut node::JniNode) })? as jboolean)
     }));
     match result {
         Ok(Ok(b)) => b,
@@ -356,7 +362,7 @@ pub extern "C" fn Java_app_mush_Native_setCryptoMode(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        runtime().block_on(unsafe { node_set_crypto_mode(handle as *mut node::JniNode, mode) })
+        block_on_reentrant(unsafe { node_set_crypto_mode(handle as *mut node::JniNode, mode) })
     }));
     match result {
         Ok(Ok(())) => {}
@@ -488,7 +494,7 @@ pub extern "C" fn Java_app_mush_Native_exportState(
         if handle == 0 {
             return Err("null handle".to_string());
         }
-        runtime().block_on(unsafe { node_export_state(handle as *mut node::JniNode) })
+        block_on_reentrant(unsafe { node_export_state(handle as *mut node::JniNode) })
     }));
     match result {
         Ok(Ok(bytes)) => to_jbyte_array(&mut env, &bytes),
@@ -517,8 +523,8 @@ pub extern "C" fn Java_app_mush_Native_importState(
         let bytes = env
             .convert_byte_array(&bytes)
             .map_err(|e| format!("bad byte array: {e}"))?;
-        let ok = runtime()
-            .block_on(unsafe { node_import_state(handle as *mut node::JniNode, &bytes) })?;
+        let ok =
+            block_on_reentrant(unsafe { node_import_state(handle as *mut node::JniNode, &bytes) })?;
         Ok(ok as jboolean)
     }));
     match result {
