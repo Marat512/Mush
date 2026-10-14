@@ -45,15 +45,16 @@
 | Samsung A36 Global | (в пути) | 35 | 15 | arm64-v8a | Owner / Reference |
 | POCO M6 Pro | eezpcaoznjrs5xxs | 36 | 16, HyperOS 3.0 | arm64-v8a | Stress Client (owner №1 в Phase 0) |
 | Xiaomi Mi 9T | f740d46d | 30 | 11, MIUI | arm64-v8a | Stable Client (owner №2 fallback) |
+| POCO M3 | 7536eb550221 | 31 | 12, MIUI 14.0.2 EEA | arm64-v8a | Owner №3 (inbound НЕ блокирован, §3.5 п.17) |
 | Huawei STK-LX1 | MVS4C20509005466 | 29 | 10, EMUI | arm64-v8a | LAN fallback / Client |
 | Redmi 5 | 2bd836517d84 | 27 | 8.1 | arm64-v8a | minSdk boundary |
 | Эмулятор | emulator-5554 | 30 | 11 | x86_64 | Rehearsal |
 | iPhone 16 Pro Max | — | — | — | — | Out of scope |
 | Samsung (1 шт. в пути) | — | 35 | 15 | arm64-v8a | Второй экземпляр (опционально) |
 
-Покрытие API: 27 → 29 → 30 → 35 → 36. Пять точек.
+Покрытие API: 27 → 29 → 30 → 31 → 35 → 36. Шесть точек.
 Покрытие вендоров: MIUI, HyperOS, EMUI, OneUI (в пути), AOSP (эмулятор).
-Покрытие чипсетов: Snapdragon (POCO, Mi 9T), Kirin (Huawei), Exynos (Samsung).
+Покрытие чипсетов: Snapdragon (POCO M3/M6, Mi 9T), Kirin (Huawei), Exynos (Samsung).
 
 ## 3. Phase 0 — до приезда Samsung (сейчас)
 
@@ -135,6 +136,10 @@ API 27 ≥ minSdk 26 → in scope.
 13. **Вендорский inbound-блок — привилегия НОВЫХ оболочек.** Redmi 5 на MIUI 8.1 (2018, API 27) входящие TCP к приложению ПРИНИМАЕТ — stealth/hard-блоков нет. Старый парк выстраивается: **owner = Redmi 5** (или Samsung при приезде), HyperOS/EMUI-устройства — клиентами (их outbound работает штатно).
 14. minSdk boundary: API 27 — полный cold start без крашей (hotspot, listener, invite, foreground-service). Самая нижняя вилка поддержки (26–27) на железе подтверждена.
 15. **0.5 (группа 3 узла) заблокирован багом runtime на arm32/arm64-железе: на Redmi 5 у tokio-runtime ровно ОДИН worker-поток вместо двух** (`worker_threads(2)` в runtime.rs; 20 потоков процесса, один `mush-jni`; panic'ов/SIGABRT в полном logcat нет — воркер не родился или умер бесшумно). Симптом: первый пир коннектится и handshake'ится штатно (в т.ч. по LAN, без вендорных блоков), **второе входящее соединение завершается на kernel-уровне (TIME_WAIT у клиента), но accept-цикл его не забирает** — классическое голодание единственного воркера. Воспроизводится стабильно (3 прогона). Гипотезы к проверке: (а) воркер умирает на первом же spawn без вывода (panic-hook перехвачен?); (б) Builder на устройстве сжимает пул (не подтверждено — на Huawei/POCO воркеров 2); (в) flush/read путь блокирует единственный воркер sync-секцией. Следующий шаг: instrument'ить runtime.rs (лог на старт/панику каждого воркера) + проверить `std::thread::available_parallelism()` на устройстве. Задача delegable: код + цикл перепроверки на железе. **0.2 при этом не затронут (один пир работает штатно).**
+
+16. **Root cause п.15 найден и зафиксирован (коммит `9ade452`, 13.10 вечер): reentrant `block_on` убивал воркер.** JNI-callback'и (onHandshakeComplete/onMessage) исполняются НА воркере tokio (dispatcher-задача, §5.3); Kotlin синхронно дёргал `Native.exportState` (autosave по throttle) → `runtime().block_on` внутри runtime-контекста → panic «Cannot start a runtime from within a runtime» → воркер умирал бесшумно (Rust-stderr в logcat не идёт; плюс ART переименовывает attach'енный поток в `Thread-N`, поэтому comm-подсчёт «1 поток mush-jni» занижал — воркеров фактически стало 1). Фикс: `block_on_reentrant` (из runtime-контекста future исполняется на scoped-thread вне контекста; все 11 JNI-входов переведены), panic-hook дублирует payload+location в tracing/logcat, `on_thread_start/stop` логи, `available_parallelism` в лог при построении runtime. Регресс-тесты: `block_on_reentrant_inside/outside_runtime_context` (14 тестов jni, 100 core — все зелёные). **Гипотезы (а)–(в) из п.15 закрыты:** воркер не «не родился» и не «сжат пулом» — Builder гарантирует 2 воркера; воркер умирал на reentrant-пути. **Статус: ждёт перепроверки на железе** (свежий APK с фиксом). Чеклист прогона 0.5 на Redmi 5: (1) в logcat `mush-jni: runtime worker up` — РОВНО 2 строки; (2) `mush-jni: runtime worker ОСТАНОВЛЕН` и `PANIC в потоке` — ОТСУТСТВУЮТ; (3) второй inbound-пир: `accepted connection from` + HandshakeComplete у owner'а; (4) 0.5-сценарий: 3 узла, история идентична на всех. Если (1) дал 2, а (3) всё равно FAIL — поднимать гипотезу (в) (sync-секция во flush/read пути блокирует оба воркера) как следующий кандидат.
+
+17. **Новое устройство в парке: POCO M3 (14.10) — inbound-проба §4.1 и 0.2-style handshake PASS, теперь owner №3.** Спека: M2010J19CG / citrus, Snapdragon 662 (bengal), 4 ГБ RAM, 64 ГБ storage (~17 ГБ free), 1080×2340 @440dpi, Android 12 (API 31), MIUI 14.0.2 EEA (V14.0.2.0.SJFEUXM, security patch 2023-04-01), arm64-v8a, serial `7536eb550221`. Прогон (оба устройства на LAN 192.168.31.x, свежий APK с фиксом `9ade452`): (1) **inbound-проба PASS** — raw TCP с Mi 9T: `accepted connection from 192.168.31.197` в logcat POCO; (2) **0.2-style handshake PASS на обеих сторонах** — `Handshake complete... Session key established` у POCO и у Mi 9T, `Group joined`; (3) доставка: `message from=CWu+Sj0w/0vJ text=privet iz testa` у POCO. (4) Рантайм с фиксом: **2 воркера `mush-jni` на обоих устройствах**, `runtime worker ОСТАНОВЛЕН`/`PANIC` отсутствуют — косвенное подтверждение п.16 на железе (частичное: полный чеклист п.16 — прогон 0.5 на Redmi 5, второй inbound-пир). **Ключевой вывод: MIUI 14 (Android 12) входящий TCP к приложению НЕ блокирует** — вендорский блок inbound из §3.6 пока специфичен для HyperOS 3.0 (hard drop) и EMUI 10 (stealth-SYN); MIUI 8.1 (п.13) и MIUI 14 (п.17) его не имеют. Гипотеза уточнена: блок — свойство новых оболочек Xiaomi (HyperOS), не MIUI как такового. Побочные замечания для прогонов: (а) `adb install` требует тоггла «Установка через USB» и клика на диалоге (известно, п.6); (б) инвайт после `cmd start` несёт hotspot-адрес — для LAN-прогонов слать `cmd lan`, дождаться строки `lan mode: advertised <LAN-IP>:<port>`, потом `cmd reinvite`; (в) `am start-foreground-service` на старом APK отклонён (service не exported) — обновить APK до свежего, после `am start MainActivity` сервис поднимается сам. **Следующий шаг: 0.5 (группа 3 узла) теперь разблокирована без Samsung** — owner = POCO M3 (arm64, MIUI 14), клиенты = Mi 9T + Huawei/Redmi 5.
 
 ## 3.6. Vendor inbound blocking (работающий раздел)
 
@@ -316,6 +321,7 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 | Samsung A36 | 15 | 35 | _______ | Y / N | — | Y / N |
 | POCO M6 Pro | 16 | 36 | _______ | Y / N | Y / N | Y / N |
 | Xiaomi Mi 9T | 11 | 30 | _______ | Y / N | Y / N | Y / N |
+| POCO M3 | 12 | 31 | _______ | — | Y | Y |
 | Huawei STK-LX1 | 10 | 29 | _______ | Y / N | Y / N | Y / N |
 | Redmi 5 | 8.1 | 27 | 192.168.43.1 | Y | Y | Y |
 
