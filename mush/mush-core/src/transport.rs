@@ -218,6 +218,13 @@ pub struct Node {
     advertised_addr: Option<String>,
     pub contacts: HashMap<PubKey, Contact>,
     pub groups: HashMap<GroupId, AdHocGroup>,
+    /// Рабочая группа: последняя, в которую узел джойнился (MUSH-HARDWARE-
+    /// TEST-PLAN §3.5 п.19). Повторный join к перезагрузившемуся owner'у
+    /// оставляет клиенту несколько групп; resolve "default" берёт последнюю
+    /// joined, а не требует ровно одну (иначе send ломается: «unknown
+    /// group 'default'»). Не persist'ится вместе с группами (NodeState
+    /// групп не хранит) — после import пересоздаётся первым join'ом.
+    last_joined: Option<GroupId>,
     pub inbox: InboxBuffer,
     s1: ContactRateSensor,
     s7: DecoyEidSensor,
@@ -289,6 +296,7 @@ impl Node {
             advertised_addr: None,
             contacts: HashMap::new(),
             groups: HashMap::new(),
+            last_joined: None,
             inbox: InboxBuffer::new(),
             s1: ContactRateSensor::new(),
             s7: DecoyEidSensor::new(me),
@@ -536,9 +544,13 @@ impl Node {
     fn resolve_group(&self, prefix: &str) -> Option<GroupId> {
         let prefix = prefix.trim_start_matches("group-");
         if prefix.is_empty() || prefix == "default" {
-            // The working group: the joined group if there is exactly one with
-            // content, otherwise the only group. A node that joined drops its
-            // empty auto-created group (see join_peer), keeping this unambiguous.
+            // Working group: the last one we joined (set in join_peer;
+            // MUSH-HARDWARE-TEST-PLAN §3.5 п.19). Fallback — the only
+            // group, if there is exactly one (e.g. the owner, who never
+            // joins: it has a single auto-created group and no last_joined).
+            if let Some(last) = self.last_joined {
+                return Some(last);
+            }
             return self
                 .groups
                 .keys()
@@ -678,6 +690,7 @@ impl Node {
                     self.groups.remove(&id);
                 }
             }
+            self.last_joined = Some(invite.group_id);
             let peer_key = bundle.identity;
             // Имя responder'а — из invite (поле `name=`; неаутентифицировано,
             // но invite и есть доверенный носитель — QR). Fallback — short key.
@@ -789,6 +802,7 @@ impl Node {
                 self.groups.remove(&id);
             }
         }
+        self.last_joined = Some(invite.group_id);
         let peer_key = session.peer_pubkey;
         self.register_peer(session, writer, reply.decoys.clone(), invite.group_id);
         // Spawn the read loop for this outbound connection (sync replies, relays).
@@ -1700,6 +1714,40 @@ mod tests {
         let node = Node::new("default", 0);
         assert_eq!(node.crypto_mode(), CryptoMode::Ratchet);
         assert!(node.pre_key_store.pending_count() >= 50);
+    }
+
+    /// Регресс MUSH-HARDWARE-TEST-PLAN §3.5 п.19: повторный join к
+    /// перезагрузившемуся owner'у оставляет клиенту несколько групп; send в
+    /// "default" обязан резолвиться в ПОСЛЕДНЮЮ joined, а не падать с
+    /// «unknown group» (старое поведение требовало ровно одну группу).
+    #[test]
+    fn resolve_default_prefers_last_joined_group() {
+        let mut node = Node::new("me", 0);
+        let me = node.pubkey();
+        let g_old = [7u8; 32];
+        let g_new = [9u8; 32];
+        node.groups
+            .insert(g_old, AdHocGroup::join(g_old, [1u8; 32], &me));
+        node.groups
+            .insert(g_new, AdHocGroup::join(g_new, [2u8; 32], &me));
+        // До фикса: две группы → resolve "default" = None.
+        node.last_joined = Some(g_new);
+        assert_eq!(node.resolve_group("default"), Some(g_new));
+        assert_eq!(node.resolve_group(""), Some(g_new));
+        node.last_joined = Some(g_old);
+        assert_eq!(node.resolve_group("default"), Some(g_old));
+
+        // Owner (не джойнился): одна авто-созданная группа — прежнее
+        // поведение по единственной группе.
+        let mut owner = Node::new("me", 0);
+        let g = [3u8; 32];
+        let me = owner.pubkey();
+        owner.groups.insert(g, AdHocGroup::join(g, [4u8; 32], &me));
+        assert_eq!(owner.resolve_group("default"), Some(g));
+
+        // Групп нет — None (честная ошибка, не паника).
+        let empty = Node::new("me", 0);
+        assert_eq!(empty.resolve_group("default"), None);
     }
 
     pub(crate) async fn cmd(node: &Arc<Mutex<Node>>, line: &str) {

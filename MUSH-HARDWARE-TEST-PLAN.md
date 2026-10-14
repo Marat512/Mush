@@ -46,17 +46,16 @@
 | POCO M6 Pro | eezpcaoznjrs5xxs | 36 | 16, HyperOS 3.0 | arm64-v8a | Stress Client (owner №1 в Phase 0) |
 | Xiaomi Mi 9T | f740d46d | 30 | 11, MIUI | arm64-v8a | Stable Client (owner №2 fallback) |
 | POCO M3 | 7536eb550221 | 31 | 12, MIUI 14.0.2 EEA | arm64-v8a | Owner №3 (inbound НЕ блокирован, §3.5 п.17) |
-| Huawei STK-LX1 | MVS4C20509005466 | 29 | 10, EMUI | arm64-v8a | LAN fallback / Client |
-| Redmi 5 | 2bd836517d84 | 27 | 8.1 | arm64-v8a | minSdk boundary |
+| Huawei STK-LX1 | MVS4C20509005466 | 29 | 10, EMUI | arm64-v8a | LAN fallback / Client (в группе 3 узлов — п.19г) |
 | Эмулятор | emulator-5554 | 30 | 11 | x86_64 | Rehearsal |
 | iPhone 16 Pro Max | — | — | — | — | Out of scope |
 | Samsung (1 шт. в пути) | — | 35 | 15 | arm64-v8a | Второй экземпляр (опционально) |
 
-Покрытие API: 27 → 29 → 30 → 31 → 35 → 36. Шесть точек.
+Покрытие API: 29 → 30 → 31 → 35 (в пути) → 36. Redmi 5 (API 27) в парке отсутствует — minSdk boundary непокрыт (§5.4, §10.3), точка 27 по нему снята из §2.
 Покрытие вендоров: MIUI, HyperOS, EMUI, OneUI (в пути), AOSP (эмулятор).
 Покрытие чипсетов: Snapdragon (POCO M3/M6, Mi 9T), Kirin (Huawei), Exynos (Samsung).
 
-## 3. Phase 0 — до приезда Samsung (сейчас)
+## 3. Phase 0 — закрыта 14.10, ждём Samsung для Phase 1
 
 Samsung в пути. Работаем на 4 физических + эмулятор. Не блокируемся.
 
@@ -143,7 +142,9 @@ API 27 ≥ minSdk 26 → in scope.
 
 18. **Phase 0.5 (группа 3 узла по LAN) и Phase 0.3 (прямой pairwise) — PASS (14.10, отчёт `docs/hardware-tests/phase-0.5-report.md`).** Схема: owner = POCO M3 (MIUI 14), client-1 = Mi 9T (MIUI 12), client-2 = **POCO M6 Pro (HyperOS 3.0)** вместо неподключённого Huawei. Все на роутере 192.168.31.x, логи streamed host-side. Результаты: оба join'а — `accepted connection` + Handshake complete на обеих сторонах (одна группа `group-81aa69`); все три отправителя (Mi 9T, M6, owner) доставлены обоим остальным узлам — **relay-перешифровка через owner-посредник впервые подтверждена на железе** (сообщение Mi 9T получено M6 и наоборот, pairwise-каналы перешифровываются на owner'е); состав истории идентичен на трёх узлах; `runtime worker up` ×2 на каждом, 0 PANIC, 0 ОСТАНОВЛЕН (полный чеклист п.16 на новом устройстве — закрыт для MIUI 14; на Redmi 5 перепроверка остаётся открытой). Phase 0.3: M6 → Mi 9T напрямую без owner'а (Mi 9T listener, handshake + доставка `direct-m6-to-mi9t`) — LAN-путь без центрального узла работает. **Ключевые находки прогона:** (а) **на M6 Pro был активен VPN NekoBox (`moe.nb4a`), `bypassable=false`, uid 0–99999** — весь трафик приложения уходил в tun0, TCP к LAN-адресу owner'а мёртв без ошибок (join_peer вис в SYN-retransmit; initiator при этом эмитит локальный `Handshake complete` — ровно ловушка §3.6). После `am force-stop moe.nb4a` join прошёл мгновенно. **Следствие: вывод §3.6 «HyperOS hard drop» получен на устройстве с VPN и подлежит ревизии** — inbound-пробу M6 Pro перепроверить с выключенным VPN до Phase 1 (скрипт `scripts/inbound-probe.sh`); (б) MIUI автоматически переподключается к запомненным AndroidShare-hotspot'ам — клиент уходил с роутера («Network is unreachable», os error 101): перед join'ом проверять `ip route` на КАЖДОМ устройстве; (в) M6 Pro при рестарте приложения сам поднимал hotspot (auto-resume дня 8) — его AP перехватывала клиентов: на прогонах сразу `cmd lan` на всех не-owner устройствах; (г) метрика «воркеры по comm» недостоверна на MIUI 14 (ART переименовывает attach'енный поток) — надёжно только строки `worker up`/`ОСТАНОВЛЕН` в streamed logcat; (д) logcat-буфер POCO M3 крошечный (события минутной давности ротированы) — прогоны только с host-side стримом; (е) debug-команды `send`/`lan`/`start`/`flood`/`decoy` не логируют приём — молчание лога ≠ зависание receiver'а (ложная тревога «wedge owner'а» по пути, разобрана в отчёте).
 
-19. **Ревизия §3.6 — переворот таблицы (14.10, второй заход): вендорский inbound-блок НЕ подтверждён ни на одном устройстве.** Прогоны: (а) **M6 Pro (HyperOS 3.0) с VPN off — inbound-проба PASS** (`accepted connection` на `inbound-probe.sh`, ~10 с) — «HyperOS hard drop» был артефактом VPN NekoBox; (б) **Huawei (EMUI 10) — inbound-проба PASS** без всяких whitelist-тогглов — «EMUI stealth-SYN» не воспроизвёлся (в прогоне 13.10 на одном из устройств парный трафик, видимо, тоже шёл через VPN/иную обходную сеть; точную причину наблюдения 13.10 установить нельзя, симптом не воспроизводится); (в) **Mi 9T (MIUI 12) — inbound-проба PASS** (принял соединение даже из hotspot-сегмента); (г) **Huawei в группе 3 узлов (EMUI-клиент закрыт)**: owner POCO M3 + Mi 9T + Huawei — оба join'а с ассертами обеих сторон, relay Mi 9T ↔ Huawei через owner в обе стороны, все доставки, `worker up` ×2 на всех трёх, 0 PANIC; (д) **Hotspot на POCO M3 (MIUI 14) — owner без LAN-костыля**: `onStarted` 192.168.246.182 на отдельном интерфейсе wlan1 при живом STA wlan0 (конCURRENT, MIUI позволяет), креды (`ssid=AndroidShare_NNNN pass=...`) пишутся в logcat, клиент подключился через `cmd wifi connect-network` → join с ассертами обеих сторон + доставка в обе стороны. **Выводы:** «вендорский блок inbound» 13.10 был артефактом сетевой среды (прежде всего VPN с `bypassable=false`), а не политикой прошивок; MUSH.md §5.0 переписан (снято ограничение «владелец группы», оставлена оговорка про VPN). **Новый функциональный баг (не блокер, в трекинг): повторный join к рестартовавшему owner'у** — у клиента остаётся старая непустая группа + новая, `resolve_group("default")` требует ровно одну группу → send в default падает с `unknown group 'default'` (transport.rs:536–547). Сценарий: owner перезагрузил телефон → все клиенты не могут писать до ручного выбора группы/перезапуска. Фикс-кандидаты: рабочая группа = последняя joined, или send по умолчанию в последнюю активную. **Прогонные заметки:** `cmd wifi connect` на MIUI 12 падает (Binder) — использовать `cmd wifi connect-network <SSID> wpa2 <pass>`; после рестарта приложения клиент MIUI уходит с запомненного hotspot'а — переподключать принудительно.
+19. **Ревизия §3.6 — переворот таблицы (14.10, второй заход): вендорский inbound-блок НЕ подтверждён ни на одном устройстве.** Прогоны: (а) **M6 Pro (HyperOS 3.0) с VPN off — inbound-проба PASS** (`accepted connection` на `inbound-probe.sh`, ~10 с) — «HyperOS hard drop» был артефактом VPN NekoBox; (б) **Huawei (EMUI 10) — inbound-проба PASS** без всяких whitelist-тогглов — «EMUI stealth-SYN» не воспроизвёлся (в прогоне 13.10 на одном из устройств парный трафик, видимо, тоже шёл через VPN/иную обходную сеть; точную причину наблюдения 13.10 установить нельзя, симптом не воспроизводится); (в) **Mi 9T (MIUI 12) — inbound-проба PASS** (принял соединение даже из hotspot-сегмента); (г) **Huawei в группе 3 узлов (EMUI-клиент закрыт)**: owner POCO M3 + Mi 9T + Huawei — оба join'а с ассертами обеих сторон, relay Mi 9T ↔ Huawei через owner в обе стороны, все доставки, `worker up` ×2 на всех трёх, 0 PANIC; (д) **Hotspot на POCO M3 (MIUI 14) — owner без LAN-костыля**: `onStarted` 192.168.246.182 на отдельном интерфейсе wlan1 при живом STA wlan0 (конCURRENT, MIUI позволяет), креды (`ssid=AndroidShare_NNNN pass=...`) пишутся в logcat, клиент подключился через `cmd wifi connect-network` → join с ассертами обеих сторон + доставка в обе стороны. **Выводы:** «вендорский блок inbound» 13.10 был артефактом сетевой среды (прежде всего VPN с `bypassable=false`), а не политикой прошивок; MUSH.md §5.0 переписан (снято ограничение «владелец группы», оставлена оговорка про VPN). **Новый функциональный баг (не блокер, в трекинг): повторный join к рестартовавшему owner'у** — у клиента остаётся старая непустая группа + новая, `resolve_group("default")` требует ровно одну группу → send в default падает с `unknown group 'default'` (transport.rs:536–547). Сценарий: owner перезагрузил телефон → все клиенты не могут писать до ручного выбора группы/перезапуска. Фикс-кандидаты: рабочая группа = последняя joined, или send по умолчанию в последнюю активную. **Прогонные заметки:** `cmd wifi connect` на MIUI 12 падает (Binder) — использовать `cmd wifi connect-network <SSID> wpa2 <pass>`; после рестарта приложения клиент MIUI уходит с запомненного hotspot'а — переподключать принудительно; **не экспортировать `ANDROID_SDK_HOME` при gradle-сборке** — AGP кладёт/генерирует debug.keystore в `$ANDROID_SDK_HOME/.android`, подпись APK расходится с устройствами → INSTALL_FAILED_UPDATE_INCOMPATIBLE (14.10: случайно воспроизведено и разобрано).
+
+20. **Баг п.19 (повторный join) — ЗАКРЫТ 14.10 (фикс + регресс-тест + перепроверка на железе).** Фикс: `Node::last_joined: Option<GroupId>` — устанавливается в `join_peer` (обе ветки, Ratchet и Legacy), `resolve_group("" / "default")` возвращает последнюю joined, fallback — прежнее поведение «ровно одна группа» для owner'а, не джойнившегося никуда (transport.rs). Не persist'ится (NodeState групп не хранит — согласовано). Регресс-тест `resolve_default_prefers_last_joined_group` (101 тест core, все зелёные). **Перепроверка на железе** (свежий APK на POCO M3 + Mi 9T): join → send OK (group-de9893) → рестарт owner'а → повторный join (group-0c9bb2, у клиента две группы) → send `msg-after-rejoin` **доставлен новому owner'у**, 0 ошибок «unknown group». Сценарий «owner перезагрузил телефон» теперь прозрачен для клиентов. **Huawei 0.1 / inbound-проба повторно зафиксирована с VPN off на обоих устройствах** (Huawei: tun0=0, VPN CONNECTED=0; POCO M3: tun0=0): `inbound-probe.sh` PASS — **EMUI остаётся в «works» (Y), не TBD**. Попутно в §6.1: Redmi 5 убран из таблицы (не в парке), §2 обновлён, покрытие API 29+31+30+36 (+35 в пути), minSdk boundary (§5.4, §10.3) помечен непокрытым. **Phase 0 закрыта** — все задачи 0.1–0.5 выполнены или осознанно исключены (minSdk), ждём Samsung для Phase 1.
 
 ## 3.6. Vendor inbound blocking (устаревший раздел — см. п.19 §3.5)
 
@@ -313,10 +314,12 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 
 ### 5.4. minSdk boundary
 
+**НЕПОКРЫТ (14.10):** Redmi 5 (API 27) отсутствует в парке, устройство недоступно для прогонов. Решение — до Phase 1: вернуть в парк, либо зафиксировать boundary по эмулятору (API 27 x86_64 AVD), либо поднять minSdk с обоснованием. Открытый пункт DoD (§10.3).
+
 | # | Устройство | PASS |
 |---|---|---|
-| S.1 | Redmi 5 (API 27) | Устанавливается, работает как клиент |
-| S.2 | Redmi 5, если API < 26 | INSTALL_FAILED_OLDER_SDK — записать в протокол |
+| S.1 | Redmi 5 (API 27) | Устанавливается, работает как клиент — НЕ ПРОГОНЯЛОСЬ |
+| S.2 | Redmi 5, если API < 26 | INSTALL_FAILED_OLDER_SDK — записать в протокол — НЕ ПРОГОНЯЛОСЬ |
 
 ## 6. Метрики для заполнения
 
@@ -328,10 +331,9 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 | POCO M6 Pro | 16 | 36 | _______ | Y (п.1 §3.5) | Y (14.10) | **Y (14.10, VPN off)** |
 | Xiaomi Mi 9T | 11 | 30 | _______ | — | Y (14.10) | Y (14.10) |
 | POCO M3 | 12 | 31 | 192.168.246.182 (wlan1, конCURRENT) | **Y (14.10)** | Y (14.10) | Y (14.10) |
-| Huawei STK-LX1 | 10 | 29 | 192.168.43.1 (п.3 §3.5) | Y | Y (14.10) | **Y (14.10)** |
-| Redmi 5 | 8.1 | 27 | 192.168.43.1 | Y | Y | Y |
+| Huawei STK-LX1 | 10 | 29 | 192.168.43.1 (п.3 §3.5) | Y | Y (14.10) | **Y (14.10, VPN off на обеих — повторная фиксация)** |
 
-Заполнено 14.10 (п.19 §3.5). **Предусловие всех проб: VPN на устройстве выключен** (NekoBox с `bypassable=false` полностью имитирует вендорный блок inbound). Пустых ячеек не осталось, кроме Samsung (в пути).
+Заполнено 14.10 (п.19 §3.5). **Предусловие всех проб: VPN на устройстве выключен** (NekoBox с `bypassable=false` полностью имитирует вендорный блок inbound). Пустых ячеек не осталось, кроме Samsung (в пути). Redmi 5 из таблицы убран — устройство не в парке (14.10), minSdk boundary непокрыт.
 
 ### 6.2. Метрики производительности
 
