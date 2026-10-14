@@ -28,6 +28,22 @@ cargo test --release   # 81 тест: crypto, ratchet, handshake (два реж�
 bash mush/scripts/smoke.sh  # smoke: два реальных процесса, 6 проверок
 ```
 
+### Сборка APK для hardware-тестов
+
+```bash
+cd mush
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+  -o mush-android/app/src/main/jniLibs build -p mush-jni   # .so → jniLibs
+cd mush-android && ./gradlew assembleDebug                 # app-debug.apk
+```
+
+> ⚠️ **Не экспортируйте `ANDROID_SDK_HOME` при запуске Gradle.** AGP ищет
+> `debug.keystore` в `$ANDROID_SDK_HOME/.android` и, не найдя, **генерирует
+> новый** — APK подпишется чужим ключом, и `adb install -r` на устройствах
+> упадёт с `INSTALL_FAILED_UPDATE_INCOMPATIBLE` (разбор: MUSH-HARDWARE-TEST-PLAN
+> §3.5 п.18д, 14.10). Для cargo-ndk SDK указывайте через `NDK_HOME`, а Gradle
+> пусть берёт sdk.dir из `mush-android/local.properties`.
+
 Что проверено: SNS-handshake (Ed25519 + X25519 + HKDF), CRDT-сходимость на 3 нодах, сенсоры S1/S7, backpressure, one-time invite, X3DH + Double Ratchet (этап A: pairwise E2E, FS, out-of-order, persistence), Android-прототип (hotspot, QR, foreground service). Чего нет (этапы B–E): Vault/SQLCipher, Safety Number, Onion, Fruiting Gateway + group E2E (sender keys), Immune plane, Vironet.
 
 **Следующий:** этап B (Vault, SQLCipher, Identicon, Safety Number) + Android hardware-проверка на Pixel/Samsung. Group E2E через sender keys — этап D. Документированное ограничение A': relay групповых сообщений видит plaintext (ATTACK-MODEL §2, MUSH-A-SPEC §4.0).

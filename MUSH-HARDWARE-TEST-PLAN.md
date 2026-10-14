@@ -185,14 +185,14 @@ API 27 ≥ minSdk 26 → in scope.
 
 ## 4. Phase 1 — после приезда Samsung
 
-Samsung = Owner/Reference. POCO переходит в Stress Client.
+Samsung = Owner/Reference. **POCO M3** (MIUI 14) — подтверждённый owner-резерв (hotspot + LAN, п.17/19): держать под рукой на случай сюрпризов Samsung. **M6 Pro** (HyperOS) — Stress Client (inbound у неё работает, п.19а; hotspot owner'ом на ней не проверялся). Без Redmi 5 (не в парке, §5.4). Парк Phase 1: **Samsung, POCO M3, M6 Pro, Mi 9T, Huawei** — 5 устройств.
 
 ### 4.1. Pre-flight
 
 - [ ] Samsung: `getprop ro.csc.sales_code` → EUX/SER/DBT (Global). Если MTS/SBL/BIL → hotspot может быть заблокирован.
 - [ ] **Inbound-проба на КАЖДОМ устройстве парка до старта пайплайна** (VPN на пробуемом устройстве выключен — VPN с `bypassable=false` полностью имитирует вендорный блок, п.18а/19 §3.5): нода подняла listener → TCP-connect к ней с другого устройства (не через `adb forward` — он loopback и блок не показывает) → строка `accepted connection` в logcat обеих сторон. Нет строки = смотреть чеклист §3.6 (VPN → AP isolation → сегменты). Без этой пробы дни 1–2 уйдут на диагностику «handshake не доходит» вместо реальных тестов. **Готово как скрипт: `scripts/inbound-probe.sh <owner_serial> <client_serial>`** (п.18 §3.5). Дополнительно перед пробой: `ip route` на обоих устройствах (MIUI авто-джойнится к запомненным hotspot'ам, п.18б) и VPN off на probing-устройстве (п.18а).
 - [ ] Кабели: оригинальные или UGREEN/Baseus 3A, по одному на устройство. Дешёвые кабели + 5 портов на хабе = flaky ADB.
-- [ ] `adb devices -l` — все 5 устройств в статусе device. Один offline или unauthorized = чинить кабель/порт, потом начинать прогон.
+- [ ] `adb devices -l` — все 5 устройств (Samsung, POCO M3, M6 Pro, Mi 9T, Huawei) в статусе device. Один offline или unauthorized = чинить кабель/порт, потом начинать прогон.
 - [ ] Battery optimization off на всех устройствах.
 - [ ] Logcat фильтр: `adb logcat -s mush:D AndroidRuntime:E *:S`.
 
@@ -203,15 +203,16 @@ Samsung = Owner/Reference. POCO переходит в Stress Client.
 | # | Устройства | Задача | PASS |
 |---|---|---|---|
 | 1.1 | Samsung (owner) | startLocalOnlyHotspot → onStarted, IP определён | IP 192.168.x.1 |
-| 1.2 | Samsung + POCO | POCO коннектится к Samsung hotspot, TCP connect | Пакеты ходят |
-| 1.3 | Samsung + POCO | Handshake, session key, session ID совпадает | Логи обеих сторон |
+| 1.2 | Samsung + M6 Pro | M6 коннектится к Samsung hotspot, TCP connect | Пакеты ходят |
+| 1.3 | Samsung + M6 Pro | Handshake, session key, session ID совпадает | Логи обеих сторон |
+| 1.4 | POCO M3 (owner-резерв) | Та же тройка 1.1–1.3 на POCO M3 | PASS (регресс MIUI 14 уже зелёный, п.17/19) |
 
 Дни 3–4 — A' критерии 1–2:
 
 | # | Устройства | Задача | PASS |
 |---|---|---|---|
-| 2.1 | Samsung + POCO | QR-контакт, /send hello | Сообщение у обоих |
-| 2.2 | Samsung + POCO | Airplane mode на обоих, QR-контакт | Handshake проходит |
+| 2.1 | Samsung + M6 Pro | QR-контакт, /send hello | Сообщение у обоих |
+| 2.2 | Samsung + M6 Pro | Airplane mode на обоих, QR-контакт | Handshake проходит |
 
 День 5 — LAN fallback (критерий 3):
 
@@ -223,17 +224,17 @@ Samsung = Owner/Reference. POCO переходит в Stress Client.
 
 | # | Устройства | Задача | PASS |
 |---|---|---|---|
-| 4.1 | Samsung + POCO + Mi 9T + Huawei | 4 человека, QR-контакт | CRDT идентичен |
-| 4.2 | Все 5 (добавить Redmi 5) | 5 человек, stress merge | История идентична |
+| 4.1 | Samsung + M6 Pro + Mi 9T + Huawei | 4 человека, QR-контакт | CRDT идентичен |
+| 4.2 | Все 5 (добавить POCO M3) | 5 человек, stress merge | История идентична |
 | 4.3 | Все 6 (если второй Samsung) | 6 человек | Consistency |
 
 Дни 9–10 — Sensors (критерии 5–7):
 
 | # | Устройства | Задача | PASS |
 |---|---|---|---|
-| 5.1 | POCO | Debug /flood 50 → S1 alert | Alert в UI |
-| 5.2 | POCO | Debug /decoy → S7 alert | Alert в UI |
-| 5.3 | POCO | /flood 150 → backpressure | Буфер ≤ 100 |
+| 5.1 | M6 Pro | Debug /flood 50 → S1 alert | Alert в UI |
+| 5.2 | M6 Pro | Debug /decoy → S7 alert | Alert в UI |
+| 5.3 | M6 Pro | /flood 150 → backpressure | Буфер ≤ 100 |
 
 Дни 11–12 — Soak (критерий 8) + MS5 (A' Done) + метрики:
 
@@ -241,11 +242,11 @@ MS5 = точка закрытия A'. Всё, что за ней — уже эт
 
 | # | Устройства | Задача | PASS |
 |---|---|---|---|
-| 8.1 | POCO | 30 мин в фоне, dumpsys activity services | isForeground=true, PID не менялся |
+| 8.1 | M6 Pro | 30 мин в фоне, dumpsys activity services | isForeground=true, PID не менялся |
 | 8.2 | Samsung | 30 мин monkey test | Нет крашей |
-| 8.3 | Samsung + POCO | verify → re-handshake → Verified сохранился | Поведенческий тест |
+| 8.3 | Samsung + M6 Pro | verify → re-handshake → Verified сохранился | Поведенческий тест |
 | M.1 | Все | Battery drain: 1 час группового чата | График разряда |
-| M.2 | Все | Hotspot IP лог: Samsung, POCO, Mi 9T, Huawei, Redmi | Таблица vendor-IP |
+| M.2 | Все | Hotspot IP лог: Samsung, POCO M3, M6 Pro, Mi 9T, Huawei | Таблица vendor-IP |
 | M.3 | Все | Финальный демо-прогон: 4 телефона, 15 мин | Видео/скриншоты |
 
 —— MS5 (A' Done) закрывается в конце дня 12. ——
@@ -314,12 +315,14 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 
 ### 5.4. minSdk boundary
 
-**НЕПОКРЫТ (14.10):** Redmi 5 (API 27) отсутствует в парке, устройство недоступно для прогонов. Решение — до Phase 1: вернуть в парк, либо зафиксировать boundary по эмулятору (API 27 x86_64 AVD), либо поднять minSdk с обоснованием. Открытый пункт DoD (§10.3).
+**ПОКРЫТ по эмулятору 14.10 (решение «зафиксировать boundary по эмулятору», п.20 §3.5):** AVD `mush-api27` (android-27, default, x86_64, Android 8.1.0). Прогон: установка app-debug.apk (minSdk 26) — **Success**; cold start — `node created`, `runtime worker up` ×2; `cmd start` → `listener started on 0.0.0.0:56849`; `cmd lan` → advertised 192.168.232.2:56849; `cmd reinvite` — invite сгенерирован; 0 ошибок, 0 FATAL. Boundary API 27 ≥ minSdk 26 подтверждён; реальное устройство API 27 (Redmi 5) в прогоне не участвовало — опционально вернуть в Phase 2.
 
 | # | Устройство | PASS |
 |---|---|---|
-| S.1 | Redmi 5 (API 27) | Устанавливается, работает как клиент — НЕ ПРОГОНЯЛОСЬ |
-| S.2 | Redmi 5, если API < 26 | INSTALL_FAILED_OLDER_SDK — записать в протокол — НЕ ПРОГОНЯЛОСЬ |
+| S.1 | Эмулятор API 27 (AVD mush-api27) | ✅ 14.10: установка, нода, listener, invite — без крашей |
+| S.2 | API < 26 | out of scope (minSdk = 26; физических устройств API < 26 в парке нет) |
+
+**Инструментальная заметка (Phase 1):** эмулятор 37.2.12 + образ API ≤ 27 + NVIDIA/Windows падает во ВСЕХ GPU-режимах (host/swiftshader/swangle/guest — крэш в gfxstream/Vulkan). Рабочий режим для старых образов: **`emulator -avd mush-api27 -no-window -gpu off -no-audio -no-boot-anim`** (headless, софтверная отрисовка гостя). Для API ≥ 30 (mush-ms0) обычный оконный режим работает.
 
 ## 6. Метрики для заполнения
 
@@ -433,7 +436,7 @@ MS6 — первый шаг этапа B. Начинается после зак
 
 - [ ] MS5 (A' Done) — закрыт.
 - [ ] MS6 (B-start) — начат (не обязательно закрыт).
-- [ ] minSdk boundary §5.4 — определён (in/out). **14.10: не покрыт** — Redmi 5 не участвовал в прогонах 14.10 (Huawei тоже отсутствовал, Phase 0.5 прогнан с POCO M6 Pro как client-2). Открыто до Phase 1: либо вернуть Redmi 5 в парк, либо зафиксировать API 27 boundary по эмулятору.
+- [ ] minSdk boundary §5.4 — определён (in/out). **✅ 14.10 — закрыто по эмулятору API 27** (установка, нода, listener, invite без крашей; S.2 out of scope).
 - [ ] Vendor-таблица §6.1 заполнена.
 - [ ] Метрики §6.2 собраны.
 - [ ] Артефакты §8 в репо.
