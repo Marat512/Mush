@@ -1,0 +1,27 @@
+--------- beginning of main
+10-14 07:21:39.769 10699 10758 I mush    : mush_jni: mush-jni: init (arch aarch64)
+10-14 07:21:39.791 10699 10758 I mush    : mush_jni::runtime: mush-jni: построение runtime: worker_threads=2, available_parallelism=8
+10-14 07:21:39.792 10699 10758 I mush    : mush_jni::node: mush-jni: node created
+10-14 07:21:39.792 10699 10770 I mush    : mush_jni::runtime: mush-jni: runtime worker up
+10-14 07:21:39.793 10699 10769 I mush    : mush_jni::runtime: mush-jni: runtime worker up
+10-14 07:21:39.870 10699 10758 I mush    : mush_jni::node: mush-jni: node state imported
+10-14 07:21:39.873 10699 10758 I mush    : mush_jni::node: mush-jni: listener started on 0.0.0.0:44999
+10-14 07:21:40.357 10699 10699 I mush    : hotspot credentials ssid=AndroidShare_3637 pass=x3amy3a8nq53ipx
+10-14 07:21:40.380 10699 10699 I mush    : LocalOnlyHotspotCallback::onStarted ip=10.14.255.160
+10-14 07:21:40.380 10699 10699 I mush    : networking ready: advertised 10.14.255.160:44999
+10-14 07:21:40.380 10699 10699 I mush    : invite=mush://mZovVEa9Rc7M9z82t3vJpNMmblzFcCu0B/u2166GW+o=&nonce=BwHk/eHES61qgNDV/0jpDA==&addr=10.14.255.160:44999&group=9JBkqoUhXi1DMfqukygd7vOu3i/lHmhh8M7xdgXs0jE=-oMUVOA0GmBog3gVRaen1jE8mFiIKUO4sdOk7MP6AXLA=&pk=p2hpZGVudGl0eZggGJkYmhgvGFQYRhi9GEUYzhjMGPcYPxg2GLcYexjJGKQY0xgmGG4YXBjFGHAYKxi0Bxj7GLYY1xiuGIYYWxjqZnNwa19pZAFjc3BrmCAYfAoYcBhxGE8YjBjhGFwYVRinGFIYRRMJGFUYphiZGGYYGxjNGPMY5BjlGDsYYhMYKhiMGB4Y8hjKGDVpc3BrX3NpZ19ymCAYyhg/GHgYexjmDxcYfhhnGNAYNxjOABjAGPgYZxh3GNwRGNEY8BjdGOUYPhjrGI0YbRj/GHcYXxjQGNBpc3BrX3NpZ19zmCAY3hi8GPAYchiVGN8Y8BhkGJYY1xjBGEAYbxieGCIYQhjwGD8YQBgqGFsYVBivGCMYgxgsGM8YpxQYchgoDGZvcGtfaWQPY29wa5ggCRhUGPkYbhjgDBhWGLsYMRjHAQwYiQ8IGIwYgRj0GOoY7xiqGDoYKBibGCgYUhhWGNAYrhjEGNYYaA==&name=bWU=
+10-14 07:21:57.664 10699 10809 I mush    : lan mode: advertised 192.168.31.18:44999
+10-14 07:24:51.286 10699 10699 I mush    : debug: join invited len=702
+10-14 07:24:51.310 10699 10770 I mush    : mush_core::transport: Handshake complete with me (183c14f288ca). Session key established.
+10-14 07:24:51.310 10699 10770 I mush    : mush_core::transport: Group joined: group-81aa69
+10-14 07:24:51.313 10699 10770 I mush    : handshake complete peer=GDwU8ojKD26o
+10-14 07:27:11.861 10699 10699 I mush    : debug: join invited len=706
+10-14 07:27:12.245 10699 10770 I mush    : mush_core::transport: Handshake complete with me (183c14f288ca). Session key established.
+10-14 07:27:12.245 10699 10770 I mush    : mush_core::transport: Group joined: group-81aa69
+10-14 07:27:12.247 10699 10770 I mush    : handshake complete peer=GDwU8ojKD26o
+10-14 07:27:38.707 10699 10769 I mush    : message from=GDwU8ojKD26o text=privet-ot-mi9t
+10-14 07:28:24.649 10699 10770 I mush    : message from=GDwU8ojKD26o text=privet-ot-poco
+10-14 07:29:30.509 10699 10699 I mush    : debug: join invited len=714
+10-14 07:29:30.807 10699 10769 I mush    : mush_core::transport: Handshake complete with me (096bbe4a3d30). Session key established.
+10-14 07:29:30.807 10699 10769 I mush    : mush_core::transport: Group joined: group-81aa69
+10-14 07:29:30.810 10699 10769 I mush    : handshake complete peer=CWu+Sj0w/0vJ

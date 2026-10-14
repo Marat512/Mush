@@ -141,9 +141,11 @@ API 27 ≥ minSdk 26 → in scope.
 
 17. **Новое устройство в парке: POCO M3 (14.10) — inbound-проба §4.1 и 0.2-style handshake PASS, теперь owner №3.** Спека: M2010J19CG / citrus, Snapdragon 662 (bengal), 4 ГБ RAM, 64 ГБ storage (~17 ГБ free), 1080×2340 @440dpi, Android 12 (API 31), MIUI 14.0.2 EEA (V14.0.2.0.SJFEUXM, security patch 2023-04-01), arm64-v8a, serial `7536eb550221`. Прогон (оба устройства на LAN 192.168.31.x, свежий APK с фиксом `9ade452`): (1) **inbound-проба PASS** — raw TCP с Mi 9T: `accepted connection from 192.168.31.197` в logcat POCO; (2) **0.2-style handshake PASS на обеих сторонах** — `Handshake complete... Session key established` у POCO и у Mi 9T, `Group joined`; (3) доставка: `message from=CWu+Sj0w/0vJ text=privet iz testa` у POCO. (4) Рантайм с фиксом: **2 воркера `mush-jni` на обоих устройствах**, `runtime worker ОСТАНОВЛЕН`/`PANIC` отсутствуют — косвенное подтверждение п.16 на железе (частичное: полный чеклист п.16 — прогон 0.5 на Redmi 5, второй inbound-пир). **Ключевой вывод: MIUI 14 (Android 12) входящий TCP к приложению НЕ блокирует** — вендорский блок inbound из §3.6 пока специфичен для HyperOS 3.0 (hard drop) и EMUI 10 (stealth-SYN); MIUI 8.1 (п.13) и MIUI 14 (п.17) его не имеют. Гипотеза уточнена: блок — свойство новых оболочек Xiaomi (HyperOS), не MIUI как такового. Побочные замечания для прогонов: (а) `adb install` требует тоггла «Установка через USB» и клика на диалоге (известно, п.6); (б) инвайт после `cmd start` несёт hotspot-адрес — для LAN-прогонов слать `cmd lan`, дождаться строки `lan mode: advertised <LAN-IP>:<port>`, потом `cmd reinvite`; (в) `am start-foreground-service` на старом APK отклонён (service не exported) — обновить APK до свежего, после `am start MainActivity` сервис поднимается сам. **Следующий шаг: 0.5 (группа 3 узла) теперь разблокирована без Samsung** — owner = POCO M3 (arm64, MIUI 14), клиенты = Mi 9T + Huawei/Redmi 5.
 
+18. **Phase 0.5 (группа 3 узла по LAN) и Phase 0.3 (прямой pairwise) — PASS (14.10, отчёт `docs/hardware-tests/phase-0.5-report.md`).** Схема: owner = POCO M3 (MIUI 14), client-1 = Mi 9T (MIUI 12), client-2 = **POCO M6 Pro (HyperOS 3.0)** вместо неподключённого Huawei. Все на роутере 192.168.31.x, логи streamed host-side. Результаты: оба join'а — `accepted connection` + Handshake complete на обеих сторонах (одна группа `group-81aa69`); все три отправителя (Mi 9T, M6, owner) доставлены обоим остальным узлам — **relay-перешифровка через owner-посредник впервые подтверждена на железе** (сообщение Mi 9T получено M6 и наоборот, pairwise-каналы перешифровываются на owner'е); состав истории идентичен на трёх узлах; `runtime worker up` ×2 на каждом, 0 PANIC, 0 ОСТАНОВЛЕН (полный чеклист п.16 на новом устройстве — закрыт для MIUI 14; на Redmi 5 перепроверка остаётся открытой). Phase 0.3: M6 → Mi 9T напрямую без owner'а (Mi 9T listener, handshake + доставка `direct-m6-to-mi9t`) — LAN-путь без центрального узла работает. **Ключевые находки прогона:** (а) **на M6 Pro был активен VPN NekoBox (`moe.nb4a`), `bypassable=false`, uid 0–99999** — весь трафик приложения уходил в tun0, TCP к LAN-адресу owner'а мёртв без ошибок (join_peer вис в SYN-retransmit; initiator при этом эмитит локальный `Handshake complete` — ровно ловушка §3.6). После `am force-stop moe.nb4a` join прошёл мгновенно. **Следствие: вывод §3.6 «HyperOS hard drop» получен на устройстве с VPN и подлежит ревизии** — inbound-пробу M6 Pro перепроверить с выключенным VPN до Phase 1 (скрипт `scripts/inbound-probe.sh`); (б) MIUI автоматически переподключается к запомненным AndroidShare-hotspot'ам — клиент уходил с роутера («Network is unreachable», os error 101): перед join'ом проверять `ip route` на КАЖДОМ устройстве; (в) M6 Pro при рестарте приложения сам поднимал hotspot (auto-resume дня 8) — его AP перехватывала клиентов: на прогонах сразу `cmd lan` на всех не-owner устройствах; (г) метрика «воркеры по comm» недостоверна на MIUI 14 (ART переименовывает attach'енный поток) — надёжно только строки `worker up`/`ОСТАНОВЛЕН` в streamed logcat; (д) logcat-буфер POCO M3 крошечный (события минутной давности ротированы) — прогоны только с host-side стримом; (е) debug-команды `send`/`lan`/`start`/`flood`/`decoy` не логируют приём — молчание лога ≠ зависание receiver'а (ложная тревога «wedge owner'а» по пути, разобрана в отчёте).
+
 ## 3.6. Vendor inbound blocking (работающий раздел)
 
-**Симптом на парке:** оба устройства (POCO HyperOS 3.0, Huawei EMUI 10) роняют входящие TCP к приложению при работающем listener'е (loopback-accept через `adb forward` работает штатно). «SYN drop» — не один феномен, три разные причины с разными следствиями:
+**Симптом на парке:** оба устройства (POCO HyperOS 3.0, Huawei EMUI 10) роняют входящие TCP к приложению при работающем listener'е (loopback-accept через `adb forward` работает штатно). «SYN drop» — не один феномен, три разные причины с разными следствиями. **Конфаунд 14.10 (п.18а): вывод про HyperOS получен на M6 Pro с активным VPN NekoBox (`bypassable=false`)** — VPN перехватывал весь трафик приложения; «hard drop» требует перепроверки с VPN off (`scripts/inbound-probe.sh`).
 
 | # | Причина | Что это | Следствие |
 |---|---|---|---|
@@ -183,7 +185,7 @@ Samsung = Owner/Reference. POCO переходит в Stress Client.
 ### 4.1. Pre-flight
 
 - [ ] Samsung: `getprop ro.csc.sales_code` → EUX/SER/DBT (Global). Если MTS/SBL/BIL → hotspot может быть заблокирован.
-- [ ] **Inbound-проба на КАЖДОМ устройстве парка до старта пайплайна** (нах. 2/4 §3.5: HyperOS и EMUI блокируют входящий TCP к приложению): нода подняла listener → TCP-connect к ней с другого устройства (не через `adb forward` — он loopback и блок не показывает) → строка `accepted connection` в logcat обеих сторон. Нет строки = вендорный блок → сначала whitelist-тогглы (Security app / Phone Manager), потом пайплайн. Без этой пробы дни 1–2 уйдут на диагностику «handshake не доходит» вместо реальных тестов.
+- [ ] **Inbound-проба на КАЖДОМ устройстве парка до старта пайплайна** (нах. 2/4 §3.5: HyperOS и EMUI блокируют входящий TCP к приложению): нода подняла listener → TCP-connect к ней с другого устройства (не через `adb forward` — он loopback и блок не показывает) → строка `accepted connection` в logcat обеих сторон. Нет строки = вендорный блок → сначала whitelist-тогглы (Security app / Phone Manager), потом пайплайн. Без этой пробы дни 1–2 уйдут на диагностику «handshake не доходит» вместо реальных тестов. **Готово как скрипт: `scripts/inbound-probe.sh <owner_serial> <client_serial>`** (п.18 §3.5). Дополнительно перед пробой: `ip route` на обоих устройствах (MIUI авто-джойнится к запомненным hotspot'ам, п.18б) и VPN off на probing-устройстве (п.18а).
 - [ ] Кабели: оригинальные или UGREEN/Baseus 3A, по одному на устройство. Дешёвые кабели + 5 портов на хабе = flaky ADB.
 - [ ] `adb devices -l` — все 5 устройств в статусе device. Один offline или unauthorized = чинить кабель/порт, потом начинать прогон.
 - [ ] Battery optimization off на всех устройствах.
@@ -320,8 +322,8 @@ adb -s <serial> logcat -d -s mush:D | grep "node state imported"
 |---|---|---|---|---|---|---|
 | Samsung A36 | 15 | 35 | _______ | Y / N | — | Y / N |
 | POCO M6 Pro | 16 | 36 | _______ | Y / N | Y / N | Y / N |
-| Xiaomi Mi 9T | 11 | 30 | _______ | Y / N | Y / N | Y / N |
-| POCO M3 | 12 | 31 | _______ | — | Y | Y |
+| Xiaomi Mi 9T | 11 | 30 | _______ | Y / N | Y (прогон 14.10) | Y / N |
+| POCO M3 | 12 | 31 | _______ | — (не прогонялся) | Y (прогон 14.10) | Y (прогон 14.10) |
 | Huawei STK-LX1 | 10 | 29 | _______ | Y / N | Y / N | Y / N |
 | Redmi 5 | 8.1 | 27 | 192.168.43.1 | Y | Y | Y |
 
@@ -423,7 +425,7 @@ MS6 — первый шаг этапа B. Начинается после зак
 
 - [ ] MS5 (A' Done) — закрыт.
 - [ ] MS6 (B-start) — начат (не обязательно закрыт).
-- [ ] minSdk boundary §5.4 — определён (in/out).
+- [ ] minSdk boundary §5.4 — определён (in/out). **14.10: не покрыт** — Redmi 5 не участвовал в прогонах 14.10 (Huawei тоже отсутствовал, Phase 0.5 прогнан с POCO M6 Pro как client-2). Открыто до Phase 1: либо вернуть Redmi 5 в парк, либо зафиксировать API 27 boundary по эмулятору.
 - [ ] Vendor-таблица §6.1 заполнена.
 - [ ] Метрики §6.2 собраны.
 - [ ] Артефакты §8 в репо.
