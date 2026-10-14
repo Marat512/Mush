@@ -20,8 +20,6 @@ die() { echo "FAIL: $*" >&2; exit 1; }
 # --- owner: listener + LAN-адвертайз (не hotspot) ---------------------------
 "$ADB" -s "$OWNER" shell "am broadcast -a app.mush.debug.CMD --es cmd start" >/dev/null
 sleep 8
-"$ADB" -s "$OWNER" shell "am broadcast -a app.mush.debug.CMD --es cmd lan" >/dev/null
-sleep 12
 
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
@@ -29,8 +27,20 @@ trap 'rm -f "$LOG"' EXIT
 CATPID=$!
 sleep 1
 
-PORT="$(grep -oE 'listener started on 0.0.0.0:[0-9]+' "$LOG" | tail -1 | grep -oE '[0-9]+$')"
-[ -n "$PORT" ] || die "listener на $OWNER не поднялся (нет 'listener started' в logcat)"
+# Auto-resume (день 8): после рестарта сервис мог сам поднять listener ДО
+# старта стрима — строка 'listener started' уже в прошлом буфере (256 KiB
+# ротируют за секунды). Поэтому порт берём из строки lan-адвертайза:
+# 'lan mode: advertised <ip>:<port>' (п.18д §3.5, прогон 14.10).
+"$ADB" -s "$OWNER" shell "am broadcast -a app.mush.debug.CMD --es cmd lan" >/dev/null
+DEADLINE=$(( $(date +%s) + 30 ))
+PORT=""
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    PORT="$(grep -oE 'advertised [0-9.]+:[0-9]+' "$LOG" | tail -1 | grep -oE '[0-9]+$')"
+    [ -n "$PORT" ] && [ "$PORT" != "0" ] && break
+    PORT=""
+    sleep 2
+done
+[ -n "$PORT" ] || { kill "$CATPID" 2>/dev/null; die "listener на $OWNER не поднялся (нет 'lan mode: advertised <ip>:<port>' в logcat)"; }
 LANIP="$("$ADB" -s "$OWNER" shell "ip -4 addr show wlan0 2>/dev/null | grep -oE '192\.168\.[0-9]+\.[0-9]+' | head -1" | tr -d '\r')"
 [ -n "$LANIP" ] || die "у $OWNER нет IPv4 на wlan0 — не в LAN?"
 echo "probe: owner=$OWNER listener=$LANIP:$PORT, connect с $CLIENT ..."
